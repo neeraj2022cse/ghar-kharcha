@@ -10,7 +10,9 @@
 const SHEETS = Object.freeze({
   transactions: ['ID', 'Date', 'CategoryID', 'Amount', 'Note', 'Type', 'CreatedAt', 'UpdatedAt'],
   categories: ['ID', 'Name', 'Type'],
-  plans: ['Month', 'Income', 'Budget']
+  plans: ['Month', 'Income', 'Budget'],
+  categoryBudgets: ['CategoryID', 'Budget'],
+  categoryBudgetOverrides: ['Month', 'CategoryID', 'Budget']
 });
 const SEED_CATEGORIES = [
   ['Plot EMI','expense'], ['Wifi','expense'], ['Gas','expense'],
@@ -116,7 +118,7 @@ function setupDatabase() {
     }
     // Store all columns as text except numeric Amount, Income, Budget.
     tab.getRange(2, 1, Math.max(tab.getMaxRows() - 1, 1), hdr.length).setNumberFormat('@');
-    const numeric = key === 'transactions' ? [4] : key === 'plans' ? [2, 3] : [];
+    const numeric = key === 'transactions' ? [4] : key === 'plans' ? [2, 3] : key === 'categoryBudgets' ? [2] : key === 'categoryBudgetOverrides' ? [3] : [];
     numeric.forEach(c => tab.getRange(2, c, Math.max(tab.getMaxRows() - 1, 1), 1).setNumberFormat('#,##0.00'));
     tab.autoResizeColumns(1, hdr.length);
   });
@@ -130,11 +132,24 @@ function setupDatabase() {
   return 'Setup completed.';
 }
 
-function sheetName_(key) { return {transactions:'Transactions', categories:'Categories', plans:'Plans'}[key]; }
+function sheetName_(key) { return {transactions:'Transactions', categories:'Categories', plans:'Plans',categoryBudgets:'CategoryBudgets',categoryBudgetOverrides:'CategoryBudgetOverrides'}[key]; }
+function ensureBudgetSheets_(ss) {
+  ['categoryBudgets','categoryBudgetOverrides'].forEach(key => {
+    const name=sheetName_(key), headers=SHEETS[key];
+    let sh=ss.getSheetByName(name);
+    if(!sh){ sh=ss.insertSheet(name); }
+    if(sh.getLastRow()===0){ sh.getRange(1,1,1,headers.length).setValues([headers]);sh.getRange(1,1,1,headers.length).setFontWeight('bold').setBackground('#dff3e8');sh.setFrozenRows(1);}
+    else if(sh.getRange(1,1,1,headers.length).getDisplayValues()[0].join('|')!==headers.join('|')) throw Error('Unexpected budget tab headers: '+name);
+  });
+}
+
 function db_() {
   const id = PropertiesService.getScriptProperties().getProperty('GHAR_KHARCHA_SHEET_ID');
   if (!id) throw Error('Database not configured. Run setupDatabase from the Apps Script editor once.');
-  return SpreadsheetApp.openById(id);
+  const ss=SpreadsheetApp.openById(id);
+  // Add only the two new V3 budget tabs automatically; existing records stay untouched.
+  ensureBudgetSheets_(ss);
+  return ss;
 }
 function readRows_(ss, key) {
   const sh = ss.getSheetByName(sheetName_(key));
@@ -194,7 +209,18 @@ function snapshot_(ss) {
       plans[r[0]] = p;
     }
   });
-  return {version:2, entries:entries, categories:categories, plans:plans};
+  const categoryBudgets={};
+  readRows_(ss,'categoryBudgets').forEach(r=>{
+    if(r[0] && r[1]!=='' && Number.isFinite(Number(String(r[1]).replace(/,/g,'')))) categoryBudgets[r[0]]=Number(String(r[1]).replace(/,/g,''));
+  });
+  const categoryBudgetOverrides={};
+  readRows_(ss,'categoryBudgetOverrides').forEach(r=>{
+    if(isMonth_(r[0]) && r[1] && r[2]!=='' && Number.isFinite(Number(String(r[2]).replace(/,/g,'')))) {
+      if(!categoryBudgetOverrides[r[0]])categoryBudgetOverrides[r[0]]={};
+      categoryBudgetOverrides[r[0]][r[1]]=Number(String(r[2]).replace(/,/g,''));
+    }
+  });
+  return {version:3, entries:entries, categories:categories, plans:plans, categoryBudgets, categoryBudgetOverrides};
 }
 /** Called on app startup and by Refresh. */
 function getAppData(session) { requireSession_(session); return snapshot_(db_()); }
@@ -266,6 +292,51 @@ function addCategory(session, name, kind) {
     SpreadsheetApp.flush();return snapshot_(ss);
   });
 }
+
+/** Rename a category without changing its ID (historic transactions remain intact). */
+function updateCategory(session, id, name, kind) {
+  requireSession_(session);
+  return lockRun_(function() {
+    const ss=db_(), cats=snapshotCategories_(ss), rows=readRows_(ss,'categories');
+    const cleanId=text_(id,100,'category ID',true), clean=text_(name,36,'category name',true);
+    if(!allowedType_(kind))throw Error('Invalid category type.');
+    const index=rows.findIndex(r=>r[0]===cleanId);
+    if(index<0)throw Error('Category not found. Refresh.');
+    if(cats.some(c=>c.id!==cleanId && c.name.toLowerCase()===clean.toLowerCase()))throw Error('Category name already exists.');
+    const old=cats.find(c=>c.id===cleanId);
+    if(old.kind!==kind && readRows_(ss,'transactions').some(r=>r[2]===cleanId))throw Error('This category has transactions. Its type cannot change; its name can be edited.');
+    if(old.kind==='expense'&&kind!=='expense'){
+      const defaults=readRows_(ss,'categoryBudgets');
+      const overrides=readRows_(ss,'categoryBudgetOverrides');
+      if(defaults.some(r=>r[0]===cleanId)||overrides.some(r=>r[1]===cleanId))throw Error('Remove this category’s budget settings before changing its type.');
+    }
+    ss.getSheetByName('Categories').getRange(index+2,1,1,3).setValues([[safeCell_(cleanId),safeCell_(clean),kind]]);
+    SpreadsheetApp.flush();return snapshot_(ss);
+  });
+}
+/** Blank input removes a rule. A 0 budget is an intentional zero limit. */
+function saveCategoryBudget(session, categoryId, scope, month, value) {
+  requireSession_(session);
+  return lockRun_(function() {
+    const ss=db_(), id=text_(categoryId,100,'category ID',true);
+    const cat=snapshotCategories_(ss).find(c=>c.id===id);
+    if(!cat || cat.kind!=='expense')throw Error('Only expense categories can have spending budgets.');
+    if(scope!=='default'&&scope!=='month')throw Error('Invalid budget scope.');
+    if(scope==='month'&&!isMonth_(month))throw Error('Invalid month.');
+    const clear=value===''||value===null||typeof value==='undefined';
+    const budget=clear?null:asNumber_(value,'category budget',999999999);
+    const key=scope==='default'?'categoryBudgets':'categoryBudgetOverrides';
+    const sh=ss.getSheetByName(sheetName_(key)),rows=readRows_(ss,key);
+    const index=rows.findIndex(r=>scope==='default'?r[0]===id:r[0]===month&&r[1]===id);
+    if(clear){if(index>=0)sh.deleteRow(index+2);}
+    else {
+      const values=scope==='default'?[safeCell_(id),budget]:[month,safeCell_(id),budget];
+      if(index>=0)sh.getRange(index+2,1,1,values.length).setValues([values]);else sh.appendRow(values);
+    }
+    SpreadsheetApp.flush();return snapshot_(ss);
+  });
+}
+
 function validateSnapshot_(raw) {
   if (!raw || !Array.isArray(raw.entries) || !Array.isArray(raw.categories) || !raw.plans || Array.isArray(raw.plans) || typeof raw.plans !== 'object') throw Error('Invalid backup format.');
   if (raw.entries.length > MAX_ENTRIES || raw.categories.length > 150) throw Error('Backup is too large.');
@@ -295,14 +366,32 @@ function validateSnapshot_(raw) {
       budget:p.budget==null||p.budget===''?'':asNumber_(p.budget,'budget',999999999)
     };
   });
-  return {entries,categories,plans};
+  const defaultRules={}, overrideRules={};
+  const rawDefaults=raw.categoryBudgets||{}, rawOverrides=raw.categoryBudgetOverrides||{};
+  if(!rawDefaults||Array.isArray(rawDefaults)||typeof rawDefaults!=='object'||!rawOverrides||Array.isArray(rawOverrides)||typeof rawOverrides!=='object')throw Error('Invalid category budget backup.');
+  for(const [id,v] of Object.entries(rawDefaults)) {
+    const c=categories.find(x=>x.id===id);if(!c||c.kind!=='expense')throw Error('Invalid budget category.');
+    defaultRules[id]=asNumber_(v,'default category budget',999999999);
+  }
+  for(const [m,rules] of Object.entries(rawOverrides)) {
+    if(!isMonth_(m)||!rules||Array.isArray(rules)||typeof rules!=='object')throw Error('Invalid month override.');
+    overrideRules[m]={};
+    for(const [id,v] of Object.entries(rules)) {
+      const c=categories.find(x=>x.id===id);if(!c||c.kind!=='expense')throw Error('Invalid override category.');
+      overrideRules[m][id]=asNumber_(v,'monthly category budget',999999999);
+    }
+  }
+  if(Object.keys(defaultRules).length>150 || Object.values(overrideRules).reduce((t,x)=>t+Object.keys(x).length,0)>3000)throw Error('Too many category budget rows.');
+  return {entries,categories,plans,categoryBudgets:defaultRules,categoryBudgetOverrides:overrideRules};
 }
 function replaceData_(ss,clean) {
   // Confirmed backup/restore operation. Restore is NOT an atomic Sheets transaction.
   const map={
     categories:clean.categories.map(c=>[safeCell_(c.id),safeCell_(c.name),c.kind]),
     transactions:clean.entries.map(e=>[safeCell_(e.id),e.date,safeCell_(e.categoryId),e.amount,safeCell_(e.note),e.kind,e.createdAt,e.updatedAt]),
-    plans:Object.keys(clean.plans).sort().map(m=>[m,clean.plans[m].income,clean.plans[m].budget])
+    plans:Object.keys(clean.plans).sort().map(m=>[m,clean.plans[m].income,clean.plans[m].budget]),
+    categoryBudgets:Object.entries(clean.categoryBudgets||{}).map(([id,n])=>[safeCell_(id),n]),
+    categoryBudgetOverrides:Object.entries(clean.categoryBudgetOverrides||{}).flatMap(([m,rules])=>Object.entries(rules).map(([id,n])=>[m,safeCell_(id),n]))
   };
   Object.keys(map).forEach(key=>{
     const sh=ss.getSheetByName(sheetName_(key));
@@ -362,7 +451,7 @@ function clearAllData(session) {
   requireSession_(session);
   return lockRun_(function() {
     const ss=db_();
-    const clean={entries:[],categories:SEED_CATEGORIES.map((p,i)=>({id:'cat_'+i,name:p[0],kind:p[1]})),plans:{}};
+    const clean={entries:[],categories:SEED_CATEGORIES.map((p,i)=>({id:'cat_'+i,name:p[0],kind:p[1]})),plans:{},categoryBudgets:{},categoryBudgetOverrides:{}};
     replaceData_(ss,clean);return snapshot_(ss);
   });
 }
