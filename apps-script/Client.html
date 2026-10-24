@@ -11,8 +11,8 @@ const CAT_NAMES = [
 ];
 const TYPES = {expense:'Expense',investment:'Investment / Saving',transfer:'Card repayment / transfer'};
 const $=id=>document.getElementById(id);
-const defaultData=()=>({version:1,entries:[],categories:CAT_NAMES.map((c,i)=>({id:'cat_'+i,name:c[0],kind:c[1]})),plans:{}});
-let data=defaultData(), selectedMonth=localMonth(new Date()), currentView='home', editingId=null, toastTimer=null, busy=false, ready=false, sessionToken=null, followCurrentMonth=true;
+const defaultData=()=>({version:3,entries:[],categories:CAT_NAMES.map((c,i)=>({id:'cat_'+i,name:c[0],kind:c[1]})),plans:{},categoryBudgets:{},categoryBudgetOverrides:{}});
+let data=defaultData(), selectedMonth=localMonth(new Date()), currentView='home', editingId=null, toastTimer=null, busy=false, ready=false, sessionToken=null, followCurrentMonth=true, analyticsYear=new Date().getFullYear();
 const INR=new Intl.NumberFormat('en-IN',{style:'currency',currency:'INR',maximumFractionDigits:2,minimumFractionDigits:0});
 function money(n){return INR.format(Number(n)||0);}
 function localDate(d){return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;}
@@ -94,7 +94,7 @@ async function unlockWithPin(event) {
     $('pin-gate').classList.add('hidden');
     $('app-shell').classList.remove('hidden');
   }catch(e){lockApp(e.message||'Unable to unlock.');}
-  finally{$('pin-input').value='';$('pin-submit').disabled=false;$('pin-submit').textContent='Unlock →';}
+  finally{$('pin-input').value='';$('pin-submit').disabled=false;$('pin-submit').innerHTML='<span>Unlock app</span><span aria-hidden="true">→</span>'; }
 }
 function setBusy(on){
   busy=on; document.body.classList.toggle('cloud-busy',on);
@@ -105,7 +105,7 @@ function setBusy(on){
 }
 function acceptSnapshot(snapshot){
   if(!snapshot || !Array.isArray(snapshot.entries)||!Array.isArray(snapshot.categories)||!snapshot.plans)throw Error('Invalid response from Google Sheets.');
-  data=snapshot;ready=true;$('connection-error').classList.add('hidden');
+  data={...snapshot,categoryBudgets:snapshot.categoryBudgets||{},categoryBudgetOverrides:snapshot.categoryBudgetOverrides||{}};ready=true;$('connection-error').classList.add('hidden');
 }
 async function refreshData(){
   if(busy)return;setBusy(true);
@@ -129,37 +129,62 @@ function catById(id){return data.categories.find(c=>c.id===id)||{name:'Uncategor
 function currentPlan(){return data.plans[selectedMonth]||{};}
 function monthEntries(m){return data.entries.filter(e=>e.date.slice(0,7)===m);}
 function categoryName(e){return catById(e.categoryId).name;}
-function render(){syncCalendarSelection();renderDashboard();renderCategorySelects();renderHistory();renderQuickRepeat();renderSettingsCategories();renderPlan();}
+function render(){syncCalendarSelection();renderDashboard();renderCategorySelects();renderHistory();renderQuickRepeat();renderSettingsCategories();renderPlan();renderBudgets();renderAnalytics();}
+function own(o,k){return Object.prototype.hasOwnProperty.call(o||{},k);}
+function budgetRule(id,month=selectedMonth){
+  const overrides=(data.categoryBudgetOverrides||{})[month]||{},defaults=data.categoryBudgets||{};
+  if(own(overrides,id))return {value:Number(overrides[id]),source:'month'};
+  if(own(defaults,id))return {value:Number(defaults[id]),source:'default'};
+  return {value:null,source:'none'};
+}
+function expenseTotals(month=selectedMonth){
+  const totals={expense:0,investment:0,transfer:0}, by={};
+  monthEntries(month).forEach(e=>{const v=Number(e.amount)||0;totals[e.kind]=(totals[e.kind]||0)+v;if(e.kind==='expense')by[e.categoryId]=(by[e.categoryId]||0)+v;});
+  return {totals,by};
+}
+function effectiveOverallBudget(month=selectedMonth){
+  const p=data.plans[month]||{};
+  if(p.budget!==undefined&&p.budget!==''&&Number(p.budget)>0)return {value:Number(p.budget),label:'Monthly budget'};
+  const configured=data.categories.filter(c=>c.kind==='expense').map(c=>budgetRule(c.id,month).value).filter(v=>v!==null);
+  return configured.length?{value:configured.reduce((a,b)=>a+b,0),label:'Category limits'}:{value:null,label:'Budget not set'};
+}
+
 function renderDashboard(){
   $('current-month-title').textContent=prettyMonth(selectedMonth);
-  const list=monthEntries(selectedMonth), spend=list.filter(e=>e.kind==='expense');
-  const totals={expense:0,investment:0,transfer:0};
-  list.forEach(e=>totals[e.kind]=(totals[e.kind]||0)+Number(e.amount));
-  const p=currentPlan();$('total-spending').textContent=money(totals.expense);
+  const list=monthEntries(selectedMonth),spend=list.filter(e=>e.kind==='expense');
+  const {totals,by}=expenseTotals(), p=currentPlan(),overall=effectiveOverallBudget();
+  $('total-spending').textContent=money(totals.expense);
   $('month-transactions').textContent=`${spend.length} spending entr${spend.length===1?'y':'ies'}`;
-  if(Number(p.budget)>0){
-    const ratio=totals.expense/Number(p.budget);
-    $('budget-status').textContent=`Budget ${money(p.budget)}`;
+  if(overall.value!==null && overall.value>0){
+    const ratio=totals.expense/overall.value;
+    $('budget-status').textContent=`${overall.label}: ${money(overall.value)}`;
     $('budget-bar').style.width=Math.min(100,ratio*100)+'%';
-    $('budget-bar').style.background=ratio>1?'#ffbcae':'#b2eac7';
-    $('hero-foot').textContent=ratio<=1?`${money(Number(p.budget)-totals.expense)} available in expense budget`:`Over expense budget by ${money(totals.expense-Number(p.budget))}`;
+    $('budget-bar').style.background=ratio>1?'#ff8893':'#7ee0b8';
+    $('hero-foot').textContent=ratio>1?`${money(totals.expense-overall.value)} over your spending target`:`${money(overall.value-totals.expense)} remaining in your spending target`;
   }else{
-    $('budget-status').textContent='Set a budget';$('budget-bar').style.width='0%';
-    $('hero-foot').textContent='Go to Settings to set your monthly expense budget.';
+    $('budget-status').textContent=overall.value===0?'Zero budget':'Set budgets';
+    $('budget-bar').style.width=overall.value===0&&totals.expense>0?'100%':'0%';
+    $('budget-bar').style.background='#ff8893';
+    $('hero-foot').textContent=overall.value===0&&totals.expense>0?'Spending exceeds your zero budget':'Set category budgets to track your monthly targets.';
   }
   $('income-total').textContent=p.income!==undefined&&p.income!==''?money(p.income):'—';
   $('investment-total').textContent=money(totals.investment);
   $('transfer-total').textContent=money(totals.transfer);
-  $('cash-left').textContent=p.income!==undefined&&p.income!==''?money(Number(p.income)-Object.values(totals).reduce((a,b)=>a+b,0)):'—';
-  const by={};spend.forEach(e=>{by[e.categoryId]=(by[e.categoryId]||0)+Number(e.amount);});
-  const groups=Object.entries(by).sort((a,b)=>b[1]-a[1]);
-  $('category-count').textContent=`${groups.length} categor${groups.length===1?'y':'ies'}`;
-  $('category-breakdown').innerHTML=groups.length?groups.map(([id,n])=>{
-    const name=catById(id).name,pct=totals.expense?100*n/totals.expense:0;
-    return `<div class="cat-row" role="button" tabindex="0" data-history-category="${esc(id)}" aria-label="Review ${esc(name)}"><div class="cat-dot">₹</div><div class="cat-info"><div class="cat-title"><span>${esc(name)}</span><b class="cat-amount">${money(n)}</b></div><div class="cat-bar"><i style="width:${pct.toFixed(2)}%"></i></div></div></div>`;
-  }).join(''):'<p class="empty-state">No spending recorded in this month.<br>Add an expense to get started.</p>';
-  const recent=[...list].sort(byRecent).slice(0,5);
-  $('recent-list').innerHTML=recent.length?recent.map(e=>txMarkup(e)).join(''):'<p class="empty-state">No entries in this month yet.</p>';
+  const remain=p.income!==undefined&&p.income!==''?Number(p.income)-Object.values(totals).reduce((a,b)=>a+b,0):null;
+  $('cash-left').textContent=remain!==null?money(remain):'—';
+  $('cash-left').classList.toggle('negative',remain!==null&&remain<0);
+  const groups=data.categories.filter(c=>c.kind==='expense').map(c=>({id:c.id,spent:by[c.id]||0,rule:budgetRule(c.id)})).filter(v=>v.spent>0||v.rule.value!==null).sort((a,b)=>{
+    const ae=a.rule.value!==null&&a.spent>a.rule.value,be=b.rule.value!==null&&b.spent>b.rule.value;
+    return Number(be)-Number(ae)||b.spent-a.spent;
+  });
+  $('category-breakdown').innerHTML=groups.length?groups.slice(0,5).map(({id,spent,rule})=>{
+    const over=rule.value!==null&&spent>rule.value;
+    const pct=rule.value===null?0:rule.value===0?(spent>0?100:0):Math.min(100,spent/rule.value*100);
+    const label=rule.value===null?'No budget set':`${money(rule.value)} limit · ${over?money(spent-rule.value)+' over':money(rule.value-spent)+' left'}`;
+    return `<div class="cat-row" role="button" tabindex="0" data-history-category="${esc(id)}"><div class="cat-dot">₹</div><div class="cat-info"><div class="cat-title"><span>${esc(catById(id).name)}</span><b class="cat-amount">${money(spent)}</b></div><div class="budget-subline"><span>${esc(label)}</span><span class="${over?'over':'ok'}">${rule.value!==null?(over?'Over budget':'On track'):''}</span></div><div class="cat-bar"><i class="${over?'over':rule.value===null?'neutral':''}" style="width:${pct.toFixed(2)}%"></i></div></div></div>`;
+  }).join(''):'<p class="empty-state">No tracked category budgets yet.<br>Set one in Manage all to get started.</p>';
+  const recent=[...list].sort(byRecent).slice(0,4);
+  $('recent-list').innerHTML=recent.length?recent.map(e=>txMarkup(e)).join(''):'<p class="empty-state">No entries for this month yet.</p>';
 }
 function byRecent(a,b){return b.date.localeCompare(a.date)||(b.createdAt||'').localeCompare(a.createdAt||'');}
 function txMarkup(e,actions=false){
@@ -190,17 +215,119 @@ function renderQuickRepeat(){
   $('quick-repeat').innerHTML=picks.length?picks.map(e=>`<button type="button" class="quick-chip" data-repeat="${esc(e.id)}">${esc(categoryName(e))} · ${money(e.amount)}</button>`).join(''):'<span class="subtle">Your recent entries will appear here for quick reuse.</span>';
 }
 function renderSettingsCategories(){
-  $('settings-categories').innerHTML=data.categories.map(c=>`<span class="category-tag" data-kind="${esc(c.kind)}" title="${esc(TYPES[c.kind])}">${esc(c.name)}${c.kind==='expense'?'':c.kind==='investment'?' · Investment':' · Transfer'}</span>`).join('');
+  $('settings-categories').innerHTML=data.categories.map(c=>`<button type="button" class="category-tag" data-category-edit="${esc(c.id)}" data-kind="${esc(c.kind)}" title="Edit ${esc(c.name)}">${esc(c.name)}${c.kind==='expense'?'':c.kind==='investment'?' · Investment':' · Transfer'} ✎</button>`).join('');
+}
+function startCategoryEdit(id){
+  const c=data.categories.find(c=>c.id===id);if(!c)return;
+  $('category-edit-id').value=id;$('new-category').value=c.name;$('new-category-kind').value=c.kind;
+  const used=data.entries.some(e=>e.categoryId===id);
+  $('new-category-kind').disabled=used;
+  $('category-form-label').textContent='Rename category';
+  $('category-submit').textContent='Save category changes';
+  $('category-cancel').classList.remove('hidden');
+  $('category-type-help').textContent=used?'This category has transactions: type is locked to protect past totals.':'You can change the type if there are no transactions or budget rules.';
+  $('new-category').focus();
+}
+function resetCategoryEdit(){
+  $('category-edit-id').value='';$('category-form').reset();$('new-category-kind').disabled=false;
+  $('category-form-label').textContent='New category name';$('category-submit').textContent='+ Add category';
+  $('category-cancel').classList.add('hidden');
+  $('category-type-help').textContent='Category type affects budget and spending calculations.';
+}
+function budgetFormSync(){
+  const id=$('budget-category').value,scope=$('budget-scope').value,rule=scope==='default'?(data.categoryBudgets||{}):((data.categoryBudgetOverrides||{})[selectedMonth]||{});
+  $('budget-amount').value=own(rule,id)?rule[id]:'';
+  $('budget-scope-help').textContent=scope==='default'?'Used every month unless a month-specific override exists.':`Only ${prettyMonth(selectedMonth)}; other months keep the default.`;
+}
+function renderBudgets(){
+  const catSel=$('budget-category'),old=catSel.value;
+  const cats=data.categories.filter(c=>c.kind==='expense');
+  catSel.innerHTML=cats.map(c=>`<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('');
+  if(cats.some(c=>c.id===old))catSel.value=old;
+  $('budget-month-label').textContent=prettyMonth(selectedMonth);
+  $('budget-month-picker').value=selectedMonth;
+  const by=expenseTotals().by;
+  const configured=cats.filter(c=>budgetRule(c.id).value!==null);
+  const within=configured.filter(c=>(by[c.id]||0)<=budgetRule(c.id).value).length;
+  $('budget-summary').textContent=`${configured.length} of ${cats.length} expense categories have budgets · ${within} within limits`;
+  $('all-category-budgets').innerHTML=cats.map(c=>{
+    const spent=by[c.id]||0,rule=budgetRule(c.id),over=rule.value!==null&&spent>rule.value;
+    const remaining=rule.value===null?null:rule.value-spent;
+    const pct=rule.value===null?0:rule.value===0?(spent>0?100:0):Math.min(100,100*spent/rule.value);
+    return `<div class="budget-item" data-budget-pick="${esc(c.id)}" role="button" tabindex="0"><div class="budget-item-head"><div><strong>${esc(c.name)}</strong><small>${rule.value===null?'Not configured':rule.source==='month'?'Monthly override':'Default budget'}</small></div><div class="budget-item-right">${money(spent)} / ${rule.value===null?'—':money(rule.value)}<small class="${over?'is-over':'is-good'}">${remaining===null?'Tap to set a budget':remaining<0?money(-remaining)+' over':money(remaining)+' remaining'}</small></div></div><div class="cat-bar"><i class="${over?'over':rule.value===null?'neutral':''}" style="width:${pct.toFixed(2)}%"></i></div></div>`;
+  }).join('');
+  budgetFormSync();
 }
 function renderPlan(){
   $('plan-month').value=selectedMonth;const p=currentPlan();
   $('plan-income').value=p.income!==undefined?p.income:'';
   $('plan-budget').value=p.budget!==undefined?p.budget:'';
 }
+
+const CHART_COLORS=['#13886F','#488DDC','#8973D8','#EFB15D','#EF837A','#8AB7A7'];
+function renderAnalytics(){
+  $('analytics-month-label').textContent=prettyMonth(selectedMonth);
+  const yearEl=$('analytics-year'),lastYear=Math.max(new Date().getFullYear()+1,Number(selectedMonth.slice(0,4))+1,analyticsYear+1);
+  yearEl.innerHTML=Array.from({length:lastYear-FIRST_YEAR+1},(_,i)=>`<option value="${FIRST_YEAR+i}">${FIRST_YEAR+i}</option>`).join('');
+  yearEl.value=String(analyticsYear);
+  renderDonut();renderBudgetBars();renderAnnual();
+}
+function renderDonut(){
+  const by=expenseTotals().by,groups=Object.entries(by).filter(p=>p[1]>0).sort((a,b)=>b[1]-a[1]);
+  const total=groups.reduce((a,p)=>a+p[1],0);
+  if(!total){$('donut-chart').innerHTML='<p class="empty-state">No spending recorded for this month yet.</p>';return;}
+  const head=groups.slice(0,5).map(p=>({name:catById(p[0]).name,value:p[1]}));
+  if(groups.length>5)head.push({name:'Other categories',value:groups.slice(5).reduce((a,p)=>a+p[1],0)});
+  const circumference=2*Math.PI*58;let used=0;
+  const arcs=head.map((g,i)=>{
+    const length=g.value/total*circumference,offset=used;used+=length;
+    return `<circle cx="82" cy="82" r="58" fill="none" stroke="${CHART_COLORS[i%CHART_COLORS.length]}" stroke-width="22" stroke-dasharray="${Math.max(0,length-1).toFixed(3)} ${circumference.toFixed(3)}" stroke-dashoffset="${(-offset).toFixed(3)}" transform="rotate(-90 82 82)"><title>${esc(g.name)}: ${money(g.value)}</title></circle>`;
+  }).join('');
+  const svg=`<svg role="img" aria-label="Spending distribution donut chart" viewBox="0 0 164 164"><circle cx="82" cy="82" r="58" fill="none" stroke="#eff3f1" stroke-width="22"/>${arcs}<text x="82" y="78" text-anchor="middle" font-size="10" fill="#81998e" font-weight="650">Total spent</text><text x="82" y="97" text-anchor="middle" font-size="16" fill="#143e34" font-weight="800">${esc(money(total))}</text></svg>`;
+  const legend=head.map((g,i)=>`<div class="legend-row"><div class="legend-label"><i class="legend-point" style="background:${CHART_COLORS[i%CHART_COLORS.length]}"></i><span>${esc(g.name)}</span></div><b class="legend-number">${Math.round(g.value/total*100)}%</b></div>`).join('');
+  $('donut-chart').innerHTML=svg+`<div class="donut-legend">${legend}</div>`;
+}
+function renderBudgetBars(){
+  const by=expenseTotals().by;
+  const rows=data.categories.filter(c=>c.kind==='expense').map(c=>({cat:c,spent:by[c.id]||0,limit:budgetRule(c.id).value})).filter(r=>r.limit!==null);
+  rows.sort((a,b)=>Number(b.spent>b.limit)-Number(a.spent>a.limit)||b.spent-a.spent);
+  if(!rows.length){$('budget-chart').innerHTML='<p class="empty-state">Set some category budgets to see a comparison chart.</p>';return;}
+  $('budget-chart').innerHTML=`<div class="budget-bars">${rows.slice(0,7).map(({cat,spent,limit})=>{
+    const max=Math.max(spent,limit,1),over=spent>limit;
+    return `<div class="bar-item"><div class="bar-item-head"><span>${esc(cat.name)}</span><b class="${over?'is-over':''}">${money(spent)} / ${money(limit)}</b></div><div class="bar-tracks"><div class="bar-track"><span class="bar-fill" style="width:${(limit/max*100).toFixed(1)}%"></span></div><div class="bar-track"><span class="bar-fill actual ${over?'over':''}" style="width:${(spent/max*100).toFixed(1)}%"></span></div></div></div>`;
+  }).join('')}</div><p class="chart-label-note">Blue = budget · Green = actual · Red = over budget. ${rows.length>7?'Showing top 7 categories.':''}</p>`;
+}
+function renderAnnual(){
+  const yr=analyticsYear,points=MONTH_OPTIONS.map((name,i)=>{
+    const month=`${yr}-${String(i+1).padStart(2,'0')}`;
+    const e=monthEntries(month).filter(e=>e.kind==='expense');
+    const val=e.length?e.reduce((a,e)=>a+Number(e.amount),0):null;
+    const cap=effectiveOverallBudget(month).value;
+    return {name:name.slice(0,3),val,cap};
+  });
+  if(points.every(p=>p.val===null)){ $('annual-chart').innerHTML='<p class="empty-state">No expense records for this year yet.<br>Switch year when older records are available.</p>';return;}
+  const W=352,H=202,left=35,right=10,top=13,bottom=30;
+  const max=Math.max(1,...points.flatMap(p=>[p.val??0,p.cap??0]));
+  const nice=Math.max(1,Math.ceil(max/1000)*1000),width=W-left-right,height=H-top-bottom;
+  const x=i=>left+width/11*i, y=v=>top+height-(v/nice*height);
+  const fmt=v=>v>=100000?(v/100000).toFixed(1)+'L':v>=1000?Math.round(v/1000)+'k':String(Math.round(v));
+  let paths='';
+  for(const key of ['val','cap']){
+    const color=key==='val'?'#168b75':'#4787d9';
+    let segment=[];
+    const flush=()=>{if(segment.length){paths+=`<path d="${segment.join(' ')}" fill="none" stroke="${color}" stroke-width="${key==='val'?3:2}" ${key==='cap'?'stroke-dasharray="6 5"':''} stroke-linecap="round" stroke-linejoin="round"/>`;segment=[];}};
+    points.forEach((p,i)=>{if(p[key]===null){flush();return;}segment.push(`${segment.length?'L':'M'}${x(i).toFixed(1)} ${y(p[key]).toFixed(1)}`);});flush();
+    points.forEach((p,i)=>{if(p[key]!==null)paths+=`<circle cx="${x(i).toFixed(1)}" cy="${y(p[key]).toFixed(1)}" r="${key==='val'?3.2:2.2}" fill="${color}"><title>${esc(points[i].name)} ${yr}: ${money(p[key])}</title></circle>`;});
+  }
+  const axes=[0,.5,1].map(k=>{const yy=top+height*(1-k);return `<line x1="${left}" x2="${W-right}" y1="${yy}" y2="${yy}" stroke="#e6eeeb" stroke-dasharray="3 3"/><text x="${left-5}" y="${yy+4}" text-anchor="end" fill="#83958d" font-size="9">${fmt(nice*k)}</text>`;}).join('');
+  const ticks=points.map((p,i)=>`<text x="${x(i).toFixed(1)}" y="${H-9}" text-anchor="middle" font-size="8.4" fill="#87998e">${p.name}</text>`).join('');
+  $('annual-chart').innerHTML=`<svg role="img" aria-label="Year ${yr} monthly spending and budget trend" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${axes}${paths}${ticks}</svg><p class="chart-label-note">Missing months are left blank, not treated as zero. Yearly values are based on recorded entries.</p>`;
+}
 function navigate(view){
   currentView=view;document.querySelectorAll('.view').forEach(el=>el.classList.toggle('hidden',el.id!==view+'-view'));
   document.querySelectorAll('.nav-item').forEach(el=>el.classList.toggle('active',el.dataset.nav===view));
-  $('floating-add').classList.toggle('hidden',view==='add');
+  if(view==='budgets'){$('budget-scope').value='month';renderBudgets();}
+  if(view==='analytics')renderAnalytics();
   if(view==='history')renderHistory();if(view==='settings')renderPlan();
   window.scrollTo({top:0,behavior:'auto'});
 }
@@ -224,7 +351,14 @@ function cleanImported(raw){
   const entries=raw.entries.map(e=>({id:String(e.id||newId()).slice(0,100),categoryId:String(e.categoryId||''),note:String(e.note||'').slice(0,160),date:String(e.date||''),amount:Number(e.amount),kind:TYPES[e.kind]?e.kind:'expense',createdAt:String(e.createdAt||new Date().toISOString()).slice(0,40)}));
   if(entries.some(e=>!validDate(e.date)||!(e.amount>0)||!Number.isFinite(e.amount)||!ids.has(e.categoryId)))throw Error('Backup has invalid expenses or unknown categories.');
   const plans={};for(const [m,p] of Object.entries(raw.plans)){if(!validMonth(m)||!p||typeof p!=='object')continue;const income=Number(p.income),budget=Number(p.budget);plans[m]={};if(p.income!==undefined&&p.income!==''&&Number.isFinite(income)&&income>=0)plans[m].income=income;if(p.budget!==undefined&&p.budget!==''&&Number.isFinite(budget)&&budget>=0)plans[m].budget=budget;}
-  return {version:1,entries,categories,plans};
+  const defaults=raw.categoryBudgets&&typeof raw.categoryBudgets==='object'&&!Array.isArray(raw.categoryBudgets)?raw.categoryBudgets:{};
+  const overrides=raw.categoryBudgetOverrides&&typeof raw.categoryBudgetOverrides==='object'&&!Array.isArray(raw.categoryBudgetOverrides)?raw.categoryBudgetOverrides:{};
+  const expenseIds=new Set(categories.filter(c=>c.kind==='expense').map(c=>c.id));
+  const cleanedDefaults={};for(const [id,n] of Object.entries(defaults))if(expenseIds.has(id)&&Number.isFinite(Number(n))&&Number(n)>=0)cleanedDefaults[id]=Number(n);
+  const cleanedOverrides={};for(const [m,values] of Object.entries(overrides))if(validMonth(m)&&values&&typeof values==='object'&&!Array.isArray(values)){
+    cleanedOverrides[m]={};for(const [id,n] of Object.entries(values))if(expenseIds.has(id)&&Number.isFinite(Number(n))&&Number(n)>=0)cleanedOverrides[m][id]=Number(n);
+  }
+  return {version:3,entries,categories,plans,categoryBudgets:cleanedDefaults,categoryBudgetOverrides:cleanedOverrides};
 }
 async function readFile(file){if(!file)return '';if(file.size>15*1024*1024)throw Error('File exceeds the 15 MB import limit.');return await file.text();}
 function parseCSV(raw){
@@ -237,7 +371,7 @@ function parseCSV(raw){
 }
 async function importJson(file){
   const contents=await readFile(file),blob=JSON.parse(contents),incoming=cleanImported(blob.data||blob);
-  if(!confirm(`Replace ALL records in your Google Sheet with this backup (${incoming.entries.length} entries)? Export a JSON backup first.`))return;
+  if(!confirm(`Replace ALL records in your Google Sheet with this backup (${incoming.entries.length} entries)? ${(!blob.data&&!blob.categoryBudgets&&!blob.categoryBudgetOverrides)||(blob.data&&!blob.data.categoryBudgets)?'This older backup has no V3 category budgets, so those will be cleared. ':''}Export a JSON backup first.`))return;
   if(!confirm('FINAL CONFIRMATION: the current Google Sheet transactions, categories and budgets will be overwritten.'))return;
   await writeData('restoreBackup',[incoming],()=>{
     selectedMonth=localMonth(new Date());followCurrentMonth=true;$('history-month').value=selectedMonth;clearForm();navigate('home');
@@ -264,7 +398,8 @@ async function importCsv(file){
 function wire(){
   $('pin-form').addEventListener('submit',unlockWithPin);
   document.querySelectorAll('[data-nav]').forEach(el=>el.addEventListener('click',()=>{if(el.dataset.nav==='add'&&editingId)clearForm();navigate(el.dataset.nav);}));
-  $('floating-add').addEventListener('click',()=>{clearForm();navigate('add');});
+  $('brand-home').addEventListener('click',()=>navigate('home'));
+  $('analytics-year').addEventListener('change',()=>{analyticsYear=Number($('analytics-year').value);renderAnnual();});
   $('prev-month').addEventListener('click',()=>shiftMonth(-1));$('next-month').addEventListener('click',()=>shiftMonth(1));
   $('this-month').addEventListener('click',()=>{setMonth(localMonth(new Date()),true);if(!editingId)$('entry-date').value=monthStartDate();});
   $('selected-year').addEventListener('change',()=>setMonth($('selected-year').value+'-'+$('selected-month').value));
@@ -303,11 +438,23 @@ function wire(){
     await writeData('savePlan',[selectedMonth,{income:inc,budget:bdg}],null,'Monthly plan saved to Google Sheets.');
   });
   $('category-form').addEventListener('submit',async event=>{
-    event.preventDefault();const name=$('new-category').value.trim(),kind=$('new-category-kind').value;
+    event.preventDefault();const name=$('new-category').value.trim(),kind=$('new-category-kind').value,id=$('category-edit-id').value;
     if(!name||!TYPES[kind])return;
-    if(data.categories.some(c=>c.name.toLowerCase()===name.toLowerCase())){toast('Category already exists.');return;}
-    await writeData('addCategory',[name,kind],()=>{$('new-category').value='';},'Category added to Google Sheets.');
+    if(data.categories.some(c=>c.id!==id&&c.name.toLowerCase()===name.toLowerCase())){toast('Category already exists.');return;}
+    await writeData(id?'updateCategory':'addCategory',id?[id,name,kind]:[name,kind],()=>resetCategoryEdit(),id?'Category updated.':'Category added.');
   });
+  $('category-cancel').addEventListener('click',resetCategoryEdit);
+  $('settings-categories').addEventListener('click',event=>{const el=event.target.closest('[data-category-edit]');if(el)startCategoryEdit(el.dataset.categoryEdit);});
+  $('budget-month-picker').addEventListener('change',()=>{const m=$('budget-month-picker').value;if(validMonth(m)&&Number(m.slice(0,4))>=FIRST_YEAR)setMonth(m);else $('budget-month-picker').value=selectedMonth;});
+  $('budget-category').addEventListener('change',budgetFormSync);
+  $('budget-scope').addEventListener('change',budgetFormSync);
+  $('budget-form').addEventListener('submit',async event=>{
+    event.preventDefault();const id=$('budget-category').value,scope=$('budget-scope').value,v=$('budget-amount').value;
+    if(v!==''&&(!Number.isFinite(Number(v))||Number(v)<0)){toast('Enter a valid budget amount.');return;}
+    await writeData('saveCategoryBudget',[id,scope,selectedMonth,v],null,'Category budget saved.');
+  });
+  $('all-category-budgets').addEventListener('click',event=>{const el=event.target.closest('[data-budget-pick]');if(!el)return;$('budget-category').value=el.dataset.budgetPick;budgetFormSync();$('budget-form').scrollIntoView({behavior:'smooth',block:'start'});});
+  $('all-category-budgets').addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){const el=event.target.closest('[data-budget-pick]');if(el){event.preventDefault();el.click();}}});
   $('export-csv').addEventListener('click',exportCsv);$('export-json').addEventListener('click',exportJson);
   $('import-json').addEventListener('change',async event=>{try{await importJson(event.target.files[0]);}catch(e){toast(`Import failed: ${e.message}`);}finally{event.target.value='';}});
   $('import-csv').addEventListener('change',async event=>{try{await importCsv(event.target.files[0]);}catch(e){toast(`Import failed: ${e.message}`);}finally{event.target.value='';}});
