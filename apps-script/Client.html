@@ -1,0 +1,333 @@
+<script>
+/* Ghar Kharcha — Google Apps Script + private Google Sheets storage. No localStorage. */
+'use strict';
+const CAT_NAMES = [
+  ['Plot EMI','expense'],['Wifi','expense'],['Gas','expense'],['Mobile Recharge','expense'],
+  ['Electricity Bill','expense'],['Ration','expense'],['Doc Visit','expense'],
+  ['Petrol & Travel','expense'],['LIC','expense'],['Health Insurance','expense'],
+  ['Bike Insurance','expense'],['SIP','investment'],['Credit Card Bill','transfer'],
+  ['Milk','expense'],['ChatGPT Subscription','expense'],['Bike Service','expense'],
+  ['Fast Food','expense'],['Medicines','expense'],['Other','expense']
+];
+const TYPES = {expense:'Expense',investment:'Investment / Saving',transfer:'Card repayment / transfer'};
+const $=id=>document.getElementById(id);
+const defaultData=()=>({version:1,entries:[],categories:CAT_NAMES.map((c,i)=>({id:'cat_'+i,name:c[0],kind:c[1]})),plans:{}});
+let data=defaultData(), selectedMonth=localMonth(new Date()), currentView='home', editingId=null, toastTimer=null, busy=false, ready=false, sessionToken=null, followCurrentMonth=true;
+const INR=new Intl.NumberFormat('en-IN',{style:'currency',currency:'INR',maximumFractionDigits:2,minimumFractionDigits:0});
+function money(n){return INR.format(Number(n)||0);}
+function localDate(d){return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;}
+function localMonth(d){return localDate(d).slice(0,7);}
+const FIRST_YEAR = 2026;
+const MONTH_OPTIONS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+function setMonth(month, follow=false) {
+  if (!validMonth(month) || Number(month.slice(0,4)) < FIRST_YEAR) return;
+  selectedMonth = month;
+  followCurrentMonth = follow;
+  $('history-month').value = month;
+  render();
+}
+function syncCalendarSelection() {
+  const [year,month] = selectedMonth.split('-').map(Number);
+  const yearEl = $('selected-year'), monthEl = $('selected-month');
+  const maxYear = Math.max(new Date().getFullYear()+1, year+1, FIRST_YEAR+1);
+  yearEl.innerHTML = Array.from({length:maxYear-FIRST_YEAR+1}, (_,i) => `<option value="${FIRST_YEAR+i}">${FIRST_YEAR+i}</option>`).join('');
+  monthEl.innerHTML = MONTH_OPTIONS.map((v,i) => `<option value="${String(i+1).padStart(2,'0')}">${v}</option>`).join('');
+  yearEl.value = String(year);
+  monthEl.value = String(month).padStart(2,'0');
+  $('prev-month').disabled = selectedMonth <= `${FIRST_YEAR}-01`;
+  $('this-month').classList.toggle('is-current',selectedMonth===localMonth(new Date()));
+  $('entry-month-context').textContent = 'Selected: '+prettyMonth(selectedMonth);
+  $('history-month-context').textContent = 'Selected: '+prettyMonth(selectedMonth);
+}
+function monthStartDate() {
+  const now = new Date();
+  return selectedMonth === localMonth(now) ? localDate(now) : selectedMonth+'-01';
+}
+function checkCalendarRollover() {
+  const actual = localMonth(new Date());
+  if (followCurrentMonth && actual !== selectedMonth && Number(actual.slice(0,4))>=FIRST_YEAR) {
+    setMonth(actual,true);
+    if(!editingId) $('entry-date').value=monthStartDate();
+  }
+}
+function prettyMonth(m){const [y,mo]=m.split('-').map(Number);return new Intl.DateTimeFormat('en-IN',{month:'long',year:'numeric'}).format(new Date(y,mo-1,1));}
+function prettyDate(s){const [y,m,d]=s.split('-').map(Number);return new Intl.DateTimeFormat('en-IN',{day:'numeric',month:'short',year:'numeric'}).format(new Date(y,m-1,d));}
+function validDate(s){if(!/^\d{4}-\d{2}-\d{2}$/.test(s))return false;const [y,m,d]=s.split('-').map(Number);const v=new Date(y,m-1,d);return v.getFullYear()===y&&v.getMonth()===m-1&&v.getDate()===d;}
+function validMonth(s){return /^\d{4}-(0[1-9]|1[0-2])$/.test(s);}
+function newId(){return typeof crypto!=='undefined'&&typeof crypto.randomUUID==='function'?crypto.randomUUID():'e_'+Date.now()+'_'+Math.random().toString(36).slice(2);}
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function toast(msg){const el=$('toast');el.textContent=msg;el.classList.remove('hidden');clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.add('hidden'),3500);}
+function api(method,...args){
+  return new Promise((resolve,reject)=>{
+    if(!window.google || !google.script || !google.script.run){reject(Error('Open the private Google Apps Script URL.'));return;}
+    if(method!=='verifyPin' && !sessionToken){reject(Error('Please unlock the app first.'));return;}
+    const params = method==='verifyPin' ? args : [sessionToken,...args];
+    try{google.script.run.withSuccessHandler(resolve).withFailureHandler(err=>reject(Error(err&&err.message?err.message:String(err))))[method](...params);}
+    catch(e){reject(e);}
+  });
+}
+function lockApp(message) {
+  sessionToken=null;ready=false;data=defaultData();editingId=null;
+  $('app-shell').classList.add('hidden');
+  $('pin-gate').classList.remove('hidden');
+  $('pin-input').value='';
+  $('pin-error').textContent=message||'';
+  $('pin-error').classList.toggle('hidden',!message);
+  setBusy(false);
+}
+async function unlockWithPin(event) {
+  event.preventDefault();
+  const pin=$('pin-input').value;
+  if(!/^\d{6,12}$/.test(pin)){ $('pin-error').textContent='Enter a 6–12 digit PIN.'; $('pin-error').classList.remove('hidden'); return; }
+  $('pin-submit').disabled=true;$('pin-submit').textContent='Checking…';
+  $('pin-error').classList.add('hidden');
+  try {
+    const auth=await api('verifyPin',pin);
+    if(!auth||!auth.token)throw Error('Invalid server response.');
+    sessionToken=auth.token;
+    data=defaultData();
+    const snapshot=await api('getAppData');
+    acceptSnapshot(snapshot);
+    selectedMonth=localMonth(new Date());followCurrentMonth=true;
+    $('history-month').value=selectedMonth;
+    clearForm();render();navigate('home');setBusy(false);
+    $('pin-gate').classList.add('hidden');
+    $('app-shell').classList.remove('hidden');
+  }catch(e){lockApp(e.message||'Unable to unlock.');}
+  finally{$('pin-input').value='';$('pin-submit').disabled=false;$('pin-submit').textContent='Unlock →';}
+}
+function setBusy(on){
+  busy=on; document.body.classList.toggle('cloud-busy',on);
+  document.querySelectorAll('.app-shell button, .app-shell input, .app-shell select').forEach(el=>{el.disabled=on||!ready;});
+  $('sync-status').textContent=on?'⟳ Syncing…':(ready?'✓ Google Drive':'⚠ Not connected');
+  $('sync-status').classList.toggle('synced',ready&&!on);
+  $('sync-status').classList.toggle('failed',!ready&&!on);
+}
+function acceptSnapshot(snapshot){
+  if(!snapshot || !Array.isArray(snapshot.entries)||!Array.isArray(snapshot.categories)||!snapshot.plans)throw Error('Invalid response from Google Sheets.');
+  data=snapshot;ready=true;$('connection-error').classList.add('hidden');
+}
+async function refreshData(){
+  if(busy)return;setBusy(true);
+  try{acceptSnapshot(await api('getAppData'));checkCalendarRollover();render();toast('Latest data loaded from Google Sheets.');}
+  catch(e){if(/Session expired|unlock/i.test(e.message)){lockApp('Session expired. Please unlock again.');return;} if(!ready){$('connection-error').textContent='Could not load your Google Sheet: '+e.message;$('connection-error').classList.remove('hidden');}toast('Connection error: '+e.message);}
+  finally{setBusy(false);$('refresh-data').disabled=false;}
+}
+async function writeData(method,args,onSuccess,message){
+  if(busy||!ready)return;
+  setBusy(true);
+  try{
+    const fresh=await api(method,...args);
+    acceptSnapshot(fresh);
+    if(onSuccess)onSuccess();
+    render();
+    toast(message||'Saved to Google Sheets ✓');
+  }catch(e){if(/Session expired|unlock/i.test(e.message)){lockApp('Session expired. Please unlock again.');}else{toast('Not saved: '+e.message);}}
+  finally{setBusy(false);}
+}
+function catById(id){return data.categories.find(c=>c.id===id)||{name:'Uncategorized',kind:'expense',id:'missing'};}
+function currentPlan(){return data.plans[selectedMonth]||{};}
+function monthEntries(m){return data.entries.filter(e=>e.date.slice(0,7)===m);}
+function categoryName(e){return catById(e.categoryId).name;}
+function render(){syncCalendarSelection();renderDashboard();renderCategorySelects();renderHistory();renderQuickRepeat();renderSettingsCategories();renderPlan();}
+function renderDashboard(){
+  $('current-month-title').textContent=prettyMonth(selectedMonth);
+  const list=monthEntries(selectedMonth), spend=list.filter(e=>e.kind==='expense');
+  const totals={expense:0,investment:0,transfer:0};
+  list.forEach(e=>totals[e.kind]=(totals[e.kind]||0)+Number(e.amount));
+  const p=currentPlan();$('total-spending').textContent=money(totals.expense);
+  $('month-transactions').textContent=`${spend.length} spending entr${spend.length===1?'y':'ies'}`;
+  if(Number(p.budget)>0){
+    const ratio=totals.expense/Number(p.budget);
+    $('budget-status').textContent=`Budget ${money(p.budget)}`;
+    $('budget-bar').style.width=Math.min(100,ratio*100)+'%';
+    $('budget-bar').style.background=ratio>1?'#ffbcae':'#b2eac7';
+    $('hero-foot').textContent=ratio<=1?`${money(Number(p.budget)-totals.expense)} available in expense budget`:`Over expense budget by ${money(totals.expense-Number(p.budget))}`;
+  }else{
+    $('budget-status').textContent='Set a budget';$('budget-bar').style.width='0%';
+    $('hero-foot').textContent='Go to Settings to set your monthly expense budget.';
+  }
+  $('income-total').textContent=p.income!==undefined&&p.income!==''?money(p.income):'—';
+  $('investment-total').textContent=money(totals.investment);
+  $('transfer-total').textContent=money(totals.transfer);
+  $('cash-left').textContent=p.income!==undefined&&p.income!==''?money(Number(p.income)-Object.values(totals).reduce((a,b)=>a+b,0)):'—';
+  const by={};spend.forEach(e=>{by[e.categoryId]=(by[e.categoryId]||0)+Number(e.amount);});
+  const groups=Object.entries(by).sort((a,b)=>b[1]-a[1]);
+  $('category-count').textContent=`${groups.length} categor${groups.length===1?'y':'ies'}`;
+  $('category-breakdown').innerHTML=groups.length?groups.map(([id,n])=>{
+    const name=catById(id).name,pct=totals.expense?100*n/totals.expense:0;
+    return `<div class="cat-row" role="button" tabindex="0" data-history-category="${esc(id)}" aria-label="Review ${esc(name)}"><div class="cat-dot">₹</div><div class="cat-info"><div class="cat-title"><span>${esc(name)}</span><b class="cat-amount">${money(n)}</b></div><div class="cat-bar"><i style="width:${pct.toFixed(2)}%"></i></div></div></div>`;
+  }).join(''):'<p class="empty-state">No spending recorded in this month.<br>Add an expense to get started.</p>';
+  const recent=[...list].sort(byRecent).slice(0,5);
+  $('recent-list').innerHTML=recent.length?recent.map(e=>txMarkup(e)).join(''):'<p class="empty-state">No entries in this month yet.</p>';
+}
+function byRecent(a,b){return b.date.localeCompare(a.date)||(b.createdAt||'').localeCompare(a.createdAt||'');}
+function txMarkup(e,actions=false){
+  const c=catById(e.categoryId),label=e.note||c.name,k=e.kind||c.kind;
+  return `<div class="transaction"><span class="cat-dot ${k==='investment'?'invest-dot':k==='transfer'?'transfer-dot':''}">${k==='investment'?'↗':k==='transfer'?'⇄':'₹'}</span><div class="tx-main"><strong>${esc(label)}</strong><small>${esc(c.name)} · ${prettyDate(e.date)} · ${TYPES[k]||'Expense'}</small></div><span class="tx-amount">${money(e.amount)}</span>${actions?`<button class="tx-action" title="Edit" aria-label="Edit transaction" data-edit="${esc(e.id)}">✎</button><button class="tx-action" title="Delete" aria-label="Delete transaction" data-delete="${esc(e.id)}">×</button>`:''}</div>`;
+}
+function renderCategorySelects(){
+  const pick=$('entry-category'),hPick=$('history-category'),keep=pick.value,filter=hPick.value;
+  const active=data.categories.filter(c=>c&&c.id&&c.name);
+  pick.innerHTML=active.map(c=>`<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('');
+  hPick.innerHTML='<option value="">All categories</option>'+active.map(c=>`<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('');
+  if(active.some(c=>c.id===keep))pick.value=keep;
+  if(active.some(c=>c.id===filter))hPick.value=filter;
+  entryKindLabel();
+}
+function entryKindLabel(){const c=catById($('entry-category').value);$('entry-kind').textContent=`This entry is recorded as: ${TYPES[c.kind]||'Expense'}.`}
+function renderHistory(){
+  const month=$('history-month').value||selectedMonth,filter=$('history-category').value,q=$('history-search').value.trim().toLocaleLowerCase();
+  const entries=data.entries.filter(e=>(!month||e.date.startsWith(month))&&(!filter||e.categoryId===filter)&&(!q||`${categoryName(e)} ${e.note}`.toLocaleLowerCase().includes(q))).sort(byRecent);
+  const total=entries.reduce((n,e)=>n+Number(e.amount),0);
+  $('history-count').textContent=`${entries.length} entr${entries.length===1?'y':'ies'}`;
+  $('history-sum').textContent=money(total);
+  $('history-list').innerHTML=entries.length?entries.map(e=>txMarkup(e,true)).join(''):'<p class="empty-state">No matching transactions.<br>Try a different month or filter.</p>';
+}
+function renderQuickRepeat(){
+  const recent=[...data.entries].sort(byRecent),seen=new Set(),picks=[];
+  for(const e of recent){const key=e.categoryId+'|'+e.note+'|'+e.amount;if(!seen.has(key)){seen.add(key);picks.push(e);}if(picks.length===5)break;}
+  $('quick-repeat').innerHTML=picks.length?picks.map(e=>`<button type="button" class="quick-chip" data-repeat="${esc(e.id)}">${esc(categoryName(e))} · ${money(e.amount)}</button>`).join(''):'<span class="subtle">Your recent entries will appear here for quick reuse.</span>';
+}
+function renderSettingsCategories(){
+  $('settings-categories').innerHTML=data.categories.map(c=>`<span class="category-tag" data-kind="${esc(c.kind)}" title="${esc(TYPES[c.kind])}">${esc(c.name)}${c.kind==='expense'?'':c.kind==='investment'?' · Investment':' · Transfer'}</span>`).join('');
+}
+function renderPlan(){
+  $('plan-month').value=selectedMonth;const p=currentPlan();
+  $('plan-income').value=p.income!==undefined?p.income:'';
+  $('plan-budget').value=p.budget!==undefined?p.budget:'';
+}
+function navigate(view){
+  currentView=view;document.querySelectorAll('.view').forEach(el=>el.classList.toggle('hidden',el.id!==view+'-view'));
+  document.querySelectorAll('.nav-item').forEach(el=>el.classList.toggle('active',el.dataset.nav===view));
+  $('floating-add').classList.toggle('hidden',view==='add');
+  if(view==='history')renderHistory();if(view==='settings')renderPlan();
+  window.scrollTo({top:0,behavior:'auto'});
+}
+function clearForm(){editingId=null;$('expense-form').reset();$('entry-date').value=monthStartDate();$('form-title').textContent='Add an expense';$('entry-save').textContent='Save expense ✓';$('cancel-edit').classList.add('hidden');entryKindLabel();}
+function beginEdit(id){const e=data.entries.find(x=>x.id===id);if(!e)return;editingId=id;$('entry-amount').value=e.amount;$('entry-category').value=e.categoryId;$('entry-note').value=e.note;$('entry-date').value=e.date;$('form-title').textContent='Edit transaction';$('entry-save').textContent='Save changes ✓';$('cancel-edit').classList.remove('hidden');entryKindLabel();navigate('add');}
+function shiftMonth(delta){const [y,m]=selectedMonth.split('-').map(Number),d=new Date(y,m-1+delta,1);setMonth(localMonth(d));}
+function emitFile(name,text,type){const blob=new Blob([text],{type});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);}
+function quoteCsv(x){let s=String(x??'');if(/^[=+@\-\t\r]/.test(s))s="'"+s;return '"'+s.replace(/"/g,'""')+'"';}
+function exportCsv(){
+  const head=['Date','Category','Note','Amount','Type'];
+  const rows=[head,...[...data.entries].sort((a,b)=>a.date.localeCompare(b.date)).map(e=>[e.date,categoryName(e),e.note,e.amount,e.kind])];
+  emitFile('ghar-kharcha-expenses-'+localDate(new Date())+'.csv','\ufeff'+rows.map(r=>r.map(quoteCsv).join(',')).join('\r\n'),'text/csv;charset=utf-8;');toast('CSV downloaded. Open in Excel to review.');
+}
+function exportJson(){emitFile('ghar-kharcha-backup-'+localDate(new Date())+'.json',JSON.stringify({app:'Ghar Kharcha',exportedAt:new Date().toISOString(),data},null,2),'application/json');toast('Full JSON backup downloaded. Store it safely.');}
+function cleanImported(raw){
+  if(!raw||!Array.isArray(raw.entries)||!Array.isArray(raw.categories)||!raw.plans||typeof raw.plans!=='object')throw Error('Invalid Ghar Kharcha backup.');
+  if(raw.entries.length>100000||raw.categories.length>1000)throw Error('Backup is too large.');
+  const categories=raw.categories.map(c=>({id:String(c.id||'').slice(0,100),name:String(c.name||'').slice(0,60),kind:TYPES[c.kind]?c.kind:'expense'})).filter(c=>c.id&&c.name);
+  if(!categories.length)throw Error('No valid categories found.');
+  const ids=new Set(categories.map(c=>c.id));
+  const entries=raw.entries.map(e=>({id:String(e.id||newId()).slice(0,100),categoryId:String(e.categoryId||''),note:String(e.note||'').slice(0,160),date:String(e.date||''),amount:Number(e.amount),kind:TYPES[e.kind]?e.kind:'expense',createdAt:String(e.createdAt||new Date().toISOString()).slice(0,40)}));
+  if(entries.some(e=>!validDate(e.date)||!(e.amount>0)||!Number.isFinite(e.amount)||!ids.has(e.categoryId)))throw Error('Backup has invalid expenses or unknown categories.');
+  const plans={};for(const [m,p] of Object.entries(raw.plans)){if(!validMonth(m)||!p||typeof p!=='object')continue;const income=Number(p.income),budget=Number(p.budget);plans[m]={};if(p.income!==undefined&&p.income!==''&&Number.isFinite(income)&&income>=0)plans[m].income=income;if(p.budget!==undefined&&p.budget!==''&&Number.isFinite(budget)&&budget>=0)plans[m].budget=budget;}
+  return {version:1,entries,categories,plans};
+}
+async function readFile(file){if(!file)return '';if(file.size>15*1024*1024)throw Error('File exceeds the 15 MB import limit.');return await file.text();}
+function parseCSV(raw){
+  const result=[];let row=[],val='',quoted=false;
+  for(let i=0;i<raw.length;i++){
+    const ch=raw[i];if(quoted){if(ch==='"'&&raw[i+1]==='"'){val+='"';i++;}else if(ch==='"')quoted=false;else val+=ch;}
+    else if(ch==='"')quoted=true;else if(ch===','){row.push(val);val='';}else if(ch==='\n'||ch==='\r'){if(ch==='\r'&&raw[i+1]==='\n')i++;row.push(val);val='';if(row.some(c=>String(c).trim()))result.push(row);row=[];}else val+=ch;
+  }
+  if(quoted)throw Error('Unclosed quote in CSV.');if(row.length||val){row.push(val);if(row.some(c=>String(c).trim()))result.push(row);}return result;
+}
+async function importJson(file){
+  const contents=await readFile(file),blob=JSON.parse(contents),incoming=cleanImported(blob.data||blob);
+  if(!confirm(`Replace ALL records in your Google Sheet with this backup (${incoming.entries.length} entries)? Export a JSON backup first.`))return;
+  if(!confirm('FINAL CONFIRMATION: the current Google Sheet transactions, categories and budgets will be overwritten.'))return;
+  await writeData('restoreBackup',[incoming],()=>{
+    selectedMonth=localMonth(new Date());followCurrentMonth=true;$('history-month').value=selectedMonth;clearForm();navigate('home');
+  },'Google Sheet restored successfully.');
+}
+async function importCsv(file){
+  const csv=await readFile(file),rows=parseCSV(csv.replace(/^\ufeff/,''));if(rows.length<2)throw Error('CSV has no entries.');
+  const headers=rows[0].map(s=>String(s).trim().toLowerCase()),col=key=>headers.indexOf(key);
+  for(const k of ['date','category','amount'])if(col(k)<0)throw Error('CSV must include Date, Category and Amount columns.');
+  const staged=[];
+  for(const row of rows.slice(1)){
+    const date=row[col('date')]||'',name=row[col('category')]||'',amount=Number(String(row[col('amount')]||'').replace(/[₹, ]/g,''));
+    if(!validDate(date)||!String(name).trim()||!Number.isFinite(amount)||amount<=0)continue;
+    const kind=col('type')>=0?String(row[col('type')]||'').trim().toLowerCase():'';
+    staged.push({date,category:String(name).trim(),amount,note:col('note')>=0?String(row[col('note')]||''):'',kind:TYPES[kind]?kind:''});
+  }
+  if(!staged.length)throw Error('No valid transaction rows found. Your original monthly summary sheet cannot be imported as individual expenses.');
+  if(staged.length>1000)throw Error('Please import at most 1000 rows per CSV.');
+  if(!confirm(`Add ${staged.length} expense rows to Google Sheets? Re-importing the same CSV creates duplicates.`))return;
+  await writeData('importTransactions',[staged],()=>{
+    selectedMonth=staged.at(-1).date.slice(0,7);followCurrentMonth=false;$('history-month').value=selectedMonth;navigate('history');
+  },`${staged.length} entries imported to Google Sheets.`);
+}
+function wire(){
+  $('pin-form').addEventListener('submit',unlockWithPin);
+  document.querySelectorAll('[data-nav]').forEach(el=>el.addEventListener('click',()=>{if(el.dataset.nav==='add'&&editingId)clearForm();navigate(el.dataset.nav);}));
+  $('floating-add').addEventListener('click',()=>{clearForm();navigate('add');});
+  $('prev-month').addEventListener('click',()=>shiftMonth(-1));$('next-month').addEventListener('click',()=>shiftMonth(1));
+  $('this-month').addEventListener('click',()=>{setMonth(localMonth(new Date()),true);if(!editingId)$('entry-date').value=monthStartDate();});
+  $('selected-year').addEventListener('change',()=>setMonth($('selected-year').value+'-'+$('selected-month').value));
+  $('selected-month').addEventListener('change',()=>setMonth($('selected-year').value+'-'+$('selected-month').value));
+  $('entry-category').addEventListener('change',entryKindLabel);
+  $('expense-form').addEventListener('submit',async event=>{
+    event.preventDefault();if(!ready||busy)return;
+    const amount=Number($('entry-amount').value),date=$('entry-date').value,categoryId=$('entry-category').value,cat=catById(categoryId);
+    if(!Number.isFinite(amount)||amount<=0||amount>999999999||!validDate(date)||cat.id==='missing'){toast('Enter a valid amount, date and category.');return;}
+    const wasEditing=Boolean(editingId);
+    const entry={id:editingId||null,amount:Math.round(amount*100)/100,date,categoryId,note:$('entry-note').value.trim()};
+    await writeData('saveEntry',[entry],()=>{
+      selectedMonth=date.slice(0,7);followCurrentMonth=selectedMonth===localMonth(new Date());$('history-month').value=selectedMonth;clearForm();navigate('home');
+    },wasEditing?'Changes saved to Google Sheets.':'Expense saved to Google Sheets ✓');
+  });
+  $('cancel-edit').addEventListener('click',()=>{clearForm();navigate('history');});
+  $('quick-repeat').addEventListener('click',event=>{const target=event.target.closest('[data-repeat]');if(!target)return;const e=data.entries.find(x=>x.id===target.dataset.repeat);if(!e)return;clearForm();$('entry-amount').value=e.amount;$('entry-category').value=e.categoryId;$('entry-note').value=e.note;$('entry-date').value=monthStartDate();entryKindLabel();window.scrollTo({top:0,behavior:'smooth'});});
+  $('history-month').addEventListener('change',()=>{if(validMonth($('history-month').value)&&Number($('history-month').value.slice(0,4))>=FIRST_YEAR)setMonth($('history-month').value);else{$('history-month').value=selectedMonth;toast('Years start from 2026.');}});
+  ['history-category','history-search'].forEach(id=>$(id).addEventListener(id==='history-search'?'input':'change',renderHistory));
+  $('category-breakdown').addEventListener('click',event=>{const e=event.target.closest('[data-history-category]');if(!e)return;$('history-month').value=selectedMonth;$('history-category').value=e.dataset.historyCategory;$('history-search').value='';navigate('history');});
+  $('category-breakdown').addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){const e=event.target.closest('[data-history-category]');if(e){event.preventDefault();e.click();}}});
+  $('history-list').addEventListener('click',async event=>{
+    if(!ready||busy)return;
+    const edit=event.target.closest('[data-edit]');if(edit){beginEdit(edit.dataset.edit);return;}
+    const del=event.target.closest('[data-delete]');if(del){
+      const entry=data.entries.find(x=>x.id===del.dataset.delete);if(!entry)return;
+      if(!confirm(`Delete ${money(entry.amount)} – ${categoryName(entry)} on ${prettyDate(entry.date)} from Google Sheets?`))return;
+      await writeData('deleteEntry',[entry.id],null,'Entry deleted from Google Sheets.');
+    }
+  });
+  $('plan-month').addEventListener('change',()=>{if(!validMonth($('plan-month').value))return;setMonth($('plan-month').value);});
+  $('monthly-settings-form').addEventListener('submit',async event=>{
+    event.preventDefault();const inc=$('plan-income').value,bdg=$('plan-budget').value;
+    if(inc!==''&&(!Number.isFinite(Number(inc))||Number(inc)<0)){toast('Invalid income.');return;}
+    if(bdg!==''&&(!Number.isFinite(Number(bdg))||Number(bdg)<0)){toast('Invalid budget.');return;}
+    await writeData('savePlan',[selectedMonth,{income:inc,budget:bdg}],null,'Monthly plan saved to Google Sheets.');
+  });
+  $('category-form').addEventListener('submit',async event=>{
+    event.preventDefault();const name=$('new-category').value.trim(),kind=$('new-category-kind').value;
+    if(!name||!TYPES[kind])return;
+    if(data.categories.some(c=>c.name.toLowerCase()===name.toLowerCase())){toast('Category already exists.');return;}
+    await writeData('addCategory',[name,kind],()=>{$('new-category').value='';},'Category added to Google Sheets.');
+  });
+  $('export-csv').addEventListener('click',exportCsv);$('export-json').addEventListener('click',exportJson);
+  $('import-json').addEventListener('change',async event=>{try{await importJson(event.target.files[0]);}catch(e){toast(`Import failed: ${e.message}`);}finally{event.target.value='';}});
+  $('import-csv').addEventListener('change',async event=>{try{await importCsv(event.target.files[0]);}catch(e){toast(`Import failed: ${e.message}`);}finally{event.target.value='';}});
+  $('refresh-data').addEventListener('click',refreshData);
+  $('clear-all').addEventListener('click',async ()=>{
+    if(!ready||busy)return;
+    if(!confirm('Delete ALL Google Sheet expenses, budgets and custom categories? Download a JSON backup first.'))return;
+    if(!confirm('FINAL CONFIRMATION: This cannot be undone without a backup.'))return;
+    await writeData('clearAllData',[],()=>{
+      selectedMonth=localMonth(new Date());followCurrentMonth=true;$('history-month').value=selectedMonth;clearForm();navigate('home');
+    },'Cloud data reset.');
+  });
+}
+function init(){
+  $('history-month').value=selectedMonth;$('entry-date').value=monthStartDate();
+  wire();render();navigate('home');setBusy(false);lockApp();
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden && ready)checkCalendarRollover();});
+  window.addEventListener('focus',()=>{if(ready)checkCalendarRollover();});
+  setInterval(()=>{if(ready)checkCalendarRollover();},60000);
+}
+document.addEventListener('DOMContentLoaded',init);
+
+</script>
