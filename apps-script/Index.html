@@ -1,111 +1,74 @@
 <!doctype html>
-<html lang="hi">
+<html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#123b32">
-  <meta name="description" content="Private family expense tracker with Google Sheets cloud storage.">
-  <?!= include('Styles'); ?>
-  <title>Ghar Kharcha · Personal Expense Tracker</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#123d37">
+<meta name="description" content="Private family money tracker powered by Google Sheets.">
+<title>Ghar Kharcha · Smart Budget Tracker</title>
+<?!= include('Styles'); ?>
 </head>
 <body>
 <section id="pin-gate" class="pin-screen" aria-labelledby="pin-title">
-  <div class="pin-card">
-    <span class="pin-symbol" aria-hidden="true">₹</span>
-    <span class="eyebrow">PRIVATE FAMILY TRACKER</span>
-    <h1 id="pin-title">Unlock Ghar Kharcha</h1>
-    <p>Enter your PIN to view or update expenses. Your Google account must also be signed in.</p>
-    <form id="pin-form" autocomplete="off">
-      <label for="pin-input">App PIN</label>
-      <input id="pin-input" type="password" inputmode="numeric" pattern="[0-9]{6,12}" minlength="6" maxlength="12" autocomplete="off" placeholder="Enter PIN" required>
-      <button id="pin-submit" type="submit" class="primary-button">Unlock <span aria-hidden="true">→</span></button>
-    </form>
-    <div id="pin-error" class="pin-error hidden" role="alert"></div>
-    <small>PIN is checked securely by Google Apps Script. No transactions are stored in browser storage.</small>
-  </div>
+ <div class="pin-card">
+  <div class="lock-illustration"><span class="pin-symbol">₹</span><span class="lock-status">● Private & secure</span></div>
+  <span class="eyebrow">YOUR PRIVATE FINANCE SPACE</span>
+  <h1 id="pin-title">Welcome back!</h1>
+  <p>Unlock Ghar Kharcha to review your family's expenses and budgets.</p>
+  <form id="pin-form" autocomplete="off">
+   <label for="pin-input">Your app PIN</label>
+   <input id="pin-input" type="password" inputmode="numeric" pattern="[0-9]{6,12}" minlength="6" maxlength="12" autocomplete="off" placeholder="Enter 6–12 digit PIN" required>
+   <button id="pin-submit" type="submit" class="primary-button"><span>Unlock app</span><span aria-hidden="true">→</span></button>
+  </form>
+  <div id="pin-error" class="pin-error hidden" role="alert"></div>
+  <small>Protected by your Google account and a server-verified PIN.</small>
+ </div>
 </section>
 <div class="app-shell hidden" id="app-shell">
-  <header class="topbar">
-    <div class="brand"><span class="brand-mark" aria-hidden="true">₹</span><span><strong>Ghar Kharcha</strong><small>My personal money tracker</small></span></div>
-    <div class="sync-group"><span class="privacy-chip" id="sync-status" aria-live="polite">⟳ Connecting…</span><button class="sync-refresh" id="refresh-data" type="button" title="Reload latest data from Google Sheets" aria-label="Refresh data">↻</button></div>
-  </header>
-  <div id="connection-error" class="connection-error hidden" role="alert"></div>
-  <main id="main">
-    <section id="home-view" class="view" aria-label="Dashboard">
-      <div class="month-row"><button class="round-button" id="prev-month" aria-label="Previous month">‹</button><div class="month-text"><small>MONTHLY OVERVIEW</small><strong id="current-month-title">—</strong></div><button class="round-button" id="next-month" aria-label="Next month">›</button></div>
-      <div class="date-controls" aria-label="Select a year and month">
-        <label>Month<select id="selected-month" aria-label="Select month"></select></label>
-        <label>Year<select id="selected-year" aria-label="Select year"></select></label>
-        <button type="button" id="this-month" class="date-current">This month</button>
-      </div>
-      <div class="hero">
-        <div class="hero-top"><div><span class="eyebrow light">Spent in selected month</span><div class="hero-amount" id="total-spending">₹0</div></div><span class="hero-symbol">↗</span></div>
-        <div class="hero-meta"><span id="month-transactions">0 expenses recorded</span><span id="budget-status">Add a budget in Settings</span></div>
-        <div class="track"><span id="budget-bar"></span></div>
-        <div class="hero-foot" id="hero-foot">Set a budget to track how much you can spend.</div>
-      </div>
-      <div class="metric-grid">
-        <div class="metric"><span>Income set</span><strong id="income-total">₹0</strong><small>Monthly salary/income</small></div>
-        <div class="metric"><span>Investments</span><strong id="investment-total">₹0</strong><small>SIP & savings</small></div>
-        <div class="metric"><span>Card / transfers</span><strong id="transfer-total">₹0</strong><small>Tracked separately</small></div>
-        <div class="metric"><span>Cash left*</span><strong id="cash-left">—</strong><small>Based on entries</small></div>
-      </div>
-      <div class="section-head"><h2>Where did it go?</h2><span id="category-count" class="subtle">0 categories</span></div>
-      <div class="panel category-panel" id="category-breakdown"><p class="empty-state">Add your first expense to see a category breakdown.</p></div>
-      <div class="section-head"><h2>Recent activity</h2><button class="text-button" data-nav="history">See all →</button></div>
-      <div class="panel" id="recent-list"><p class="empty-state">No expenses added yet.</p></div>
-      <p class="helper">*Cash left = income − recorded spending − investments − transfers. Credit card purchases and repayments must not be double-counted when reviewing spending.</p>
-    </section>
-
-    <section id="add-view" class="view hidden" aria-label="Add expense">
-      <div class="view-title"><span class="eyebrow">QUICK ENTRY</span><h1 id="form-title">Add an expense</h1><p>Amount, category, note — बस इतना ही! <span id="entry-month-context"></span></p></div>
-      <form id="expense-form" class="panel form-panel">
-        <label for="entry-amount">Amount <span class="required">*</span></label>
-        <div class="amount-field"><span>₹</span><input type="number" id="entry-amount" min="0.01" step="0.01" max="999999999" inputmode="decimal" placeholder="0" required autocomplete="off"></div>
-        <label for="entry-category">Category <span class="required">*</span></label>
-        <select id="entry-category" required></select>
-        <label for="entry-note">Note <span class="optional">(optional)</span></label>
-        <input id="entry-note" maxlength="160" placeholder="e.g. Milk, market, grocery, bill" autocomplete="off">
-        <label for="entry-date">Date</label><input type="date" id="entry-date" required>
-        <div class="entry-kind" id="entry-kind">This will count as an expense.</div>
-        <button type="submit" class="primary-button" id="entry-save">Save expense ✓</button>
-        <button type="button" class="muted-button hidden" id="cancel-edit">Cancel editing</button>
-      </form>
-      <div class="section-head"><h2>Quick repeat</h2><span class="subtle">Use a previous entry</span></div>
-      <div class="quick-list" id="quick-repeat"></div>
-    </section>
-
-    <section id="history-view" class="view hidden" aria-label="Expense history">
-      <div class="view-title"><span class="eyebrow">TRANSACTIONS</span><h1>Expense history</h1><p>Search, filter, edit and review the selected month. <span id="history-month-context"></span></p></div>
-      <div class="panel filters"><div class="filter-grid"><div><label for="history-month">Month</label><input type="month" id="history-month"></div><div><label for="history-category">Category</label><select id="history-category"><option value="">All categories</option></select></div></div><input id="history-search" placeholder="Search notes or categories..." aria-label="Search expenses"><div class="filter-footer"><span id="history-count">0 entries</span><strong id="history-sum">₹0</strong></div></div>
-      <div class="panel" id="history-list"><p class="empty-state">No transactions found.</p></div>
-    </section>
-
-    <section id="settings-view" class="view hidden" aria-label="Settings and backups">
-      <div class="view-title"><span class="eyebrow">YOUR PERSONAL SETUP</span><h1>Settings & backup</h1><p>Manage budget, categories and your own data.</p></div>
-      <form id="monthly-settings-form" class="panel form-panel">
-        <h2>Monthly planning</h2><p class="mini-description">Amounts apply to the month selected on the dashboard.</p>
-        <label for="plan-month">Select month</label><input type="month" id="plan-month" required>
-        <label for="plan-income">Income / salary (₹)</label><input type="number" id="plan-income" min="0" step="0.01" inputmode="decimal" placeholder="Optional">
-        <label for="plan-budget">Expense budget (₹)</label><input type="number" id="plan-budget" min="0" step="0.01" inputmode="decimal" placeholder="Optional">
-        <button type="submit" class="primary-button">Save monthly plan</button>
-        <p class="helper no-margin">Budget compares only everyday/fixed expenses; investments and transfers stay separate.</p>
-      </form>
-      <div class="panel settings-card"><h2>Categories</h2><p class="mini-description">Based on your Excel sheet. SIP is treated as investment; card repayments as transfers to avoid double-counting spending.</p><div id="settings-categories" class="category-tags"></div>
-        <form id="category-form" class="category-form"><input id="new-category" maxlength="36" placeholder="New category name" required><select id="new-category-kind" aria-label="Category type"><option value="expense">Expense</option><option value="investment">Investment</option><option value="transfer">Transfer</option></select><button type="submit" class="secondary-button">+ Add</button></form>
-      </div>
-      <div class="panel settings-card"><h2>Your data & backup</h2><p class="mini-description">Your records are stored in a private Google Sheet in your own Drive. Every change needs internet and is saved to Sheets. CSV/JSON are optional manual backups.</p>
-        <div class="action-stack"><button type="button" id="export-csv" class="secondary-button">↓ Export expenses as CSV (Excel)</button><button type="button" id="export-json" class="secondary-button">↓ Full backup as JSON</button><label for="import-json" class="file-button">↑ Restore JSON backup</label><input id="import-json" class="visually-hidden" type="file" accept=".json,application/json"><label for="import-csv" class="file-button">↑ Import expense CSV</label><input id="import-csv" class="visually-hidden" type="file" accept=".csv,text/csv"></div>
-        <p class="helper">JSON backup keeps entries, custom categories and monthly budgets. Restore replaces current data after confirmation. CSV import adds transaction rows.</p>
-      </div>
-      <div class="panel settings-card warning"><h2>Privacy reminder</h2><p>Source code may be public on GitHub, but this app and Google Sheet must be private. Google account sign-in and the server PIN are both required. Update your PIN through GitHub Actions Secrets and redeploy. Never commit your PIN or Google credentials.</p><button type="button" class="danger-link" id="clear-all">Delete all Google Sheet records</button></div>
-      <footer class="footer">Ghar Kharcha · Private Google Sheets · PIN protected</footer>
-    </section>
-  </main>
-  <button class="floating-add" id="floating-add" aria-label="Add expense" title="Add expense">+</button>
-  <nav class="bottom-nav" aria-label="Main navigation"><button class="nav-item active" data-nav="home"><span class="nav-icon">▦</span>Home</button><button class="nav-item" data-nav="add"><span class="nav-icon">⊕</span>Add</button><button class="nav-item" data-nav="history"><span class="nav-icon">▤</span>History</button><button class="nav-item" data-nav="settings"><span class="nav-icon">⚙</span>Settings</button></nav>
-  <div class="toast hidden" id="toast" role="status" aria-live="polite"></div>
+ <header class="topbar">
+  <button id="brand-home" type="button" class="brand" aria-label="Go to Home"><span class="brand-mark">₹</span><span><strong>Ghar Kharcha</strong><small>Family money, made simple</small></span></button>
+  <div class="sync-group"><span class="privacy-chip" id="sync-status">⟳ Connecting</span><button class="sync-refresh" id="refresh-data" type="button" title="Refresh Google Sheets" aria-label="Refresh data">↻</button></div>
+ </header>
+ <div id="connection-error" class="connection-error hidden" role="alert"></div>
+ <main id="main">
+  <section id="home-view" class="view" aria-label="Home dashboard">
+   <div class="month-row"><button class="round-button" id="prev-month" aria-label="Previous month">‹</button><div class="month-text"><small>YOUR MONTHLY SNAPSHOT</small><strong id="current-month-title">—</strong></div><button class="round-button" id="next-month" aria-label="Next month">›</button></div>
+   <div class="date-controls"><label>Month<select id="selected-month" aria-label="Select month"></select></label><label>Year<select id="selected-year" aria-label="Select year"></select></label><button type="button" id="this-month" class="date-current">Today</button></div>
+   <div class="hero"><div class="hero-content"><div class="hero-heading"><span>Total spending</span><span class="hero-star">✦</span></div><div class="hero-amount" id="total-spending">₹0</div><div class="hero-meta"><span id="month-transactions">0 entries</span><span id="budget-status">Budget not set</span></div><div class="track"><span id="budget-bar"></span></div><p id="hero-foot" class="hero-foot">Track your spending with category budgets.</p></div><div class="hero-decoration" aria-hidden="true"></div></div>
+   <div class="metric-grid"><div class="metric"><span>Monthly income</span><strong id="income-total">—</strong><small>Set in Settings</small></div><div class="metric"><span>Cash remaining</span><strong id="cash-left">—</strong><small>Estimated balance</small></div><div class="metric"><span>Investments</span><strong id="investment-total">₹0</strong><small>Tracked separately</small></div><div class="metric"><span>Card / transfers</span><strong id="transfer-total">₹0</strong><small>Not counted as spending</small></div></div>
+   <div class="section-head"><h2>Category budgets</h2><button type="button" class="text-button" data-nav="budgets">Manage all <span aria-hidden="true">→</span></button></div>
+   <div class="panel" id="category-breakdown"><p class="empty-state">Set your category budgets to see progress.</p></div>
+   <div class="section-head"><h2>Recent activity</h2><button type="button" class="text-button" data-nav="history">See all →</button></div>
+   <div class="panel" id="recent-list"><p class="empty-state">No recent transactions.</p></div>
+   <div class="tip-strip"><span>✦</span><p>Tip: Set default budgets once; adjust individual months whenever you need.</p></div>
+   <p class="helper">*Estimated cash = income − spending − investments − transfers. Avoid counting credit-card purchases and repayments twice.</p>
+  </section>
+  <section id="add-view" class="view hidden" aria-label="Add expense">
+   <div class="view-title"><span class="eyebrow">QUICK ENTRY</span><h1 id="form-title">Add an expense</h1><p>A few taps, and you're done. <span id="entry-month-context"></span></p></div>
+   <form id="expense-form" class="panel form-panel"><label for="entry-amount">Amount <span class="required">*</span></label><div class="amount-field"><span>₹</span><input type="number" id="entry-amount" min="0.01" step="0.01" max="999999999" inputmode="decimal" placeholder="0" required autocomplete="off"></div><label for="entry-category">Category <span class="required">*</span></label><select id="entry-category" required></select><label for="entry-note">Note <span class="optional">(optional)</span></label><input id="entry-note" maxlength="160" placeholder="What was this for?" autocomplete="off"><label for="entry-date">Date</label><input type="date" id="entry-date" required><div class="entry-kind" id="entry-kind">Expense</div><button type="submit" class="primary-button" id="entry-save">Save expense ✓</button><button type="button" class="muted-button hidden" id="cancel-edit">Cancel editing</button></form>
+   <div class="section-head"><h2>Quick repeat</h2><span class="subtle">Your past entries</span></div><div class="quick-list" id="quick-repeat"></div>
+  </section>
+  <section id="analytics-view" class="view hidden" aria-label="Spending analytics">
+   <div class="view-title"><span class="eyebrow">YOUR MONEY INSIGHTS</span><h1>Analytics</h1><p>Understand where money goes, and how your spending changes.</p></div>
+   <div class="analytics-toolbar panel"><div><span class="toolbar-caption">CURRENT VIEW</span><strong id="analytics-month-label">October 2026</strong></div><button class="small-outline" type="button" data-nav="home">Change month</button></div>
+   <div class="panel chart-card"><div class="chart-title"><div><h2>Spending mix</h2><p>Category shares · selected month</p></div><span class="chart-chip">Donut</span></div><div id="donut-chart" class="donut-layout"></div></div>
+   <div class="panel chart-card"><div class="chart-title"><div><h2>Budget vs actual</h2><p>Category limits for selected month</p></div><span class="chart-chip">Bar</span></div><div id="budget-chart"></div></div>
+   <div class="panel chart-card"><div class="chart-title"><div><h2>Monthly spending trend</h2><p>Compare Jan–Dec · select a year</p></div><label class="chart-year">Year<select id="analytics-year" aria-label="Analytics year"></select></label></div><div id="annual-chart" class="annual-chart"></div><div class="chart-legend"><span><i class="legend-point teal"></i> Spending</span><span><i class="legend-point sky"></i> Monthly budget</span></div></div>
+  </section>
+  <section id="history-view" class="view hidden" aria-label="Expense history"><div class="view-title"><span class="eyebrow">ALL TRANSACTIONS</span><h1>Expense history</h1><p>Search, filter and edit transactions. <span id="history-month-context"></span></p></div><div class="panel filters"><div class="filter-grid"><div><label for="history-month">Month</label><input type="month" id="history-month"></div><div><label for="history-category">Category</label><select id="history-category"><option value="">All categories</option></select></div></div><input id="history-search" placeholder="Search notes or categories…" aria-label="Search expenses"><div class="filter-footer"><span id="history-count">0 entries</span><strong id="history-sum">₹0</strong></div></div><div class="panel" id="history-list"><p class="empty-state">No transactions found.</p></div></section>
+  <section id="budgets-view" class="view hidden" aria-label="Category budget management"><button type="button" class="back-link" data-nav="home">← Back to Home</button><div class="view-title"><span class="eyebrow">SMART BUDGETS</span><h1>Category budgets</h1><p>Defaults carry forward every month. Monthly overrides affect only the selected month.</p></div>
+   <div class="panel budget-scope-card"><div class="budget-heading"><label class="budget-month-control">Selected month<input id="budget-month-picker" type="month" aria-label="Choose month for category budgets"></label><strong id="budget-month-label">—</strong></div><div class="budget-summary" id="budget-summary"></div><div id="all-category-budgets" class="budget-list"></div></div>
+   <form id="budget-form" class="panel form-panel"><h2>Set a category budget</h2><p class="mini-description">Choose a default limit or a one-month exception.</p><label for="budget-category">Category</label><select id="budget-category" required></select><label for="budget-scope">Apply budget to</label><select id="budget-scope"><option value="default">Default — every month</option><option value="month">Only selected month</option></select><p id="budget-scope-help" class="hint-line">This becomes the default for future months unless overridden.</p><label for="budget-amount">Amount (₹)</label><input id="budget-amount" type="number" inputmode="decimal" min="0" step="0.01" placeholder="e.g. 5000"><p class="hint-line">Leave amount empty and save to remove this rule. ₹0 is an intentional zero limit.</p><button type="submit" class="primary-button">Save category budget</button></form>
+  </section>
+  <section id="settings-view" class="view hidden" aria-label="Settings and backups"><div class="view-title"><span class="eyebrow">MAKE IT YOURS</span><h1>Settings</h1><p>Personalize your spending plan, categories and backups.</p></div>
+   <form id="monthly-settings-form" class="panel form-panel"><h2>Monthly planning</h2><p class="mini-description">This income and overall budget apply to one selected month.</p><label for="plan-month">Month</label><input type="month" id="plan-month" required><label for="plan-income">Income / salary (₹)</label><input type="number" id="plan-income" min="0" step="0.01" inputmode="decimal" placeholder="Optional"><label for="plan-budget">Overall expense budget (₹)</label><input type="number" id="plan-budget" min="0" step="0.01" inputmode="decimal" placeholder="Optional"><button type="submit" class="primary-button">Save monthly plan</button><p class="helper no-margin">If no overall budget is set, Home can use the sum of configured category budgets.</p></form>
+   <div class="panel settings-card"><div class="settings-head"><h2>Manage categories</h2><button class="small-outline" data-nav="budgets" type="button">Set budgets →</button></div><p class="mini-description">Tap any category to rename it. Existing transactions will keep their category ID.</p><div id="settings-categories" class="category-tags"></div><form id="category-form" class="category-form"><input id="category-edit-id" type="hidden"><label for="new-category" id="category-form-label">New category name</label><input id="new-category" maxlength="36" placeholder="Category name" required><label for="new-category-kind">Type</label><select id="new-category-kind" aria-label="Category type"><option value="expense">Expense</option><option value="investment">Investment</option><option value="transfer">Transfer</option></select><p id="category-type-help" class="hint-line">Category type affects budget and spending calculations.</p><button type="submit" id="category-submit" class="secondary-button">+ Add category</button><button type="button" id="category-cancel" class="muted-button hidden">Cancel edit</button></form></div>
+   <div class="panel settings-card"><h2>Your data & backup</h2><p class="mini-description">Transactions and budgets are kept in your private Google Sheet. Download a backup before major updates.</p><div class="action-stack"><button type="button" id="export-csv" class="secondary-button">↓ Export expenses as CSV</button><button type="button" id="export-json" class="secondary-button">↓ Full backup as JSON</button><label for="import-json" class="file-button">↑ Restore JSON backup</label><input id="import-json" class="visually-hidden" type="file" accept=".json,application/json"><label for="import-csv" class="file-button">↑ Import expense CSV</label><input id="import-csv" class="visually-hidden" type="file" accept=".csv,text/csv"></div><p class="helper">V3 backups include category defaults and monthly overrides. Restoring older V2 backups resets the new budget rules.</p></div>
+   <div class="panel settings-card warning"><h2>Privacy & security</h2><p>Your Google Sheet and Apps Script must stay private. Never publish your PIN, credentials or financial exports. Use GitHub Actions Secrets to change your PIN.</p><button type="button" class="danger-link" id="clear-all">Delete all Google Sheet records</button></div><footer class="footer">Ghar Kharcha V3 · Private Google Sheets · PIN protected</footer>
+  </section>
+ </main>
+ <nav class="bottom-nav" aria-label="Main navigation"><button class="nav-item active" data-nav="home"><span class="nav-icon">⌂</span><span>Home</span></button><button class="nav-item" data-nav="add"><span class="nav-icon">＋</span><span>Add</span></button><button class="nav-item" data-nav="analytics"><span class="nav-icon">◉</span><span>Insights</span></button><button class="nav-item" data-nav="history"><span class="nav-icon">≡</span><span>History</span></button><button class="nav-item" data-nav="settings"><span class="nav-icon">⚙</span><span>Settings</span></button></nav>
+ <div class="toast hidden" id="toast" role="status" aria-live="polite"></div>
 </div>
 <?!= include('Client'); ?>
-</body>
-</html>
+</body></html>
