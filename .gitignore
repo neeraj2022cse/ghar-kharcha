@@ -1,0 +1,19 @@
+# Private security files
+apps-script/PrivatePin.gs
+.clasp.json
+.clasprc.json
+.env
+.env.*
+
+# Dependencies
+**/node_modules/
+**/client-check.js
+**/server-check.js
+*.log
+
+# Personal financial data
+*.csv
+*.xlsx
+*.xls
+*backup*.json
+*expenses*.json
