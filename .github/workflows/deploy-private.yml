@@ -1,0 +1,39 @@
+name: Deploy private expense app and PIN
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ghar-kharcha-deploy
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Generate private PIN verifier and clasp credentials
+        env:
+          APP_PIN: ${{ secrets.APP_PIN }}
+          SCRIPT_ID: ${{ secrets.SCRIPT_ID }}
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+        run: |
+          node scripts/make-private-pin.mjs
+          node scripts/setup-clasp.mjs
+      - name: Deploy code to private Apps Script project
+        run: |
+          npx --yes @google/clasp push --force
+      - name: Update existing owner-only web deployment
+        env:
+          DEPLOYMENT_ID: ${{ secrets.DEPLOYMENT_ID }}
+        run: |
+          if [ -z "$DEPLOYMENT_ID" ]; then
+            echo "Add DEPLOYMENT_ID from Google Apps Script > Deploy > Manage deployments." >&2
+            exit 1
+          fi
+          npx --yes @google/clasp update-deployment "$DEPLOYMENT_ID" --description "Secure Ghar Kharcha update"
