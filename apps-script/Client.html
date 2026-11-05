@@ -205,13 +205,17 @@ function isCardBillCategory(cat){
   return !!cat && cat.kind==='transfer' && (cat.id==='cat_12'||/^credit\s*card\s*(?:bill|payment|repayment)$/i.test(cat.name.trim()));
 }
 function eligibleForBudget(cat){return !!cat&&(cat.kind==='expense'||cat.kind==='investment'||isCardBillCategory(cat));}
-function isCardBillEntry(e){return e.kind==='transfer'&&isCardBillCategory(catById(e.categoryId));}
+// An Expense paid on a credit card is a PURCHASE, never a bill repayment.
+// The dedicated Credit Card Bill transfer category is the ONLY source of bill-paid totals.
+// Keep the conditions mutually exclusive so an inconsistent/legacy row cannot inflate Bill Paid.
+function isCardPurchase(e){return e.kind==='expense' && e.isCreditCard===true;}
+function isCardBillEntry(e){return e.kind==='transfer' && e.isCreditCard!==true && isCardBillCategory(catById(e.categoryId));}
 function expenseTotals(month=selectedMonth){
   const totals={expense:0,investment:0,transfer:0,cardBill:0,otherTransfers:0,cardPurchases:0,master:0},by={};
   monthEntries(month).forEach(e=>{
     const v=Number(e.amount)||0, kind=TYPES[e.kind]?e.kind:'expense', cat=catById(e.categoryId);
     totals[kind]+=v;
-    if(e.kind==='expense'&&e.isCreditCard===true)totals.cardPurchases+=v;
+    if(isCardPurchase(e))totals.cardPurchases+=v;
     if(isCardBillEntry(e))totals.cardBill+=v;
     else if(e.kind==='transfer')totals.otherTransfers+=v;
     if(eligibleForBudget(cat))by[e.categoryId]=(by[e.categoryId]||0)+v;
@@ -226,7 +230,7 @@ function cardBalanceAsOf(month=selectedMonth){
   const groups={};for(const e of entries){const m=e.date.slice(0,7);(groups[m]||=[]).push(e);}
   let balance=0;let monthCharges=0;
   for(const m of Object.keys(groups).sort()){
-    const charges=groups[m].filter(e=>e.kind==='expense'&&e.isCreditCard===true).reduce((n,e)=>n+Number(e.amount||0),0);
+    const charges=groups[m].filter(isCardPurchase).reduce((n,e)=>n+Number(e.amount||0),0);
     const payments=groups[m].filter(isCardBillEntry).reduce((n,e)=>n+Number(e.amount||0),0);
     balance=Math.max(0,balance-payments)+charges;
     if(m===month)monthCharges=charges;
@@ -292,7 +296,7 @@ function renderDashboard(){
 function byRecent(a,b){return b.date.localeCompare(a.date)||(b.createdAt||'').localeCompare(a.createdAt||'');}
 function txMarkup(e,actions=false){
   const c=catById(e.categoryId),label=e.note||c.name,k=e.kind||c.kind;
-  return `<div class="transaction">${categoryAvatar(c)}<div class="tx-main"><strong>${esc(label)}</strong><small>${esc(c.name)} · ${prettyDate(e.date)} · ${TYPES[k]||'Expense'}${e.isCreditCard===true?' · 💳 Card':''}</small></div><span class="tx-amount">${money(e.amount)}</span>${actions?`<button class="tx-action" title="Edit" aria-label="Edit transaction" data-edit="${esc(e.id)}">${iconMarkup('pencil')}</button><button class="tx-action" title="Delete" aria-label="Delete transaction" data-delete="${esc(e.id)}">${iconMarkup('trash-2')}</button>`:''}</div>`;
+  return `<div class="transaction">${categoryAvatar(c)}<div class="tx-main"><strong>${esc(label)}</strong><small>${esc(c.name)} · ${prettyDate(e.date)} · ${TYPES[k]||'Expense'}${isCardPurchase(e)?' · 💳 Card purchase':''}</small></div><span class="tx-amount">${money(e.amount)}</span>${actions?`<button class="tx-action" title="Edit" aria-label="Edit transaction" data-edit="${esc(e.id)}">${iconMarkup('pencil')}</button><button class="tx-action" title="Delete" aria-label="Delete transaction" data-delete="${esc(e.id)}">${iconMarkup('trash-2')}</button>`:''}</div>`;
 }
 function renderCategorySelects(){
   const pick=$('entry-category'),hPick=$('history-category'),keep=pick.value,filter=hPick.value;
@@ -305,9 +309,15 @@ function renderCategorySelects(){
 }
 function entryKindLabel(){
   const c=catById($('entry-category').value);
-  $('entry-kind').textContent=`This entry is recorded as: ${TYPES[c.kind]||'Expense'}.`;
-  $('credit-card-row').classList.toggle('hidden',c.kind!=='expense');
-  if(c.kind!=='expense')$('entry-is-credit-card').checked=false;
+  const isExpense=c.kind==='expense';
+  const isBill=isCardBillCategory(c);
+  $('entry-kind').textContent=isBill
+    ? 'Card bill repayment: included in Bill Paid, reduces older outstanding.'
+    : `This entry is recorded as: ${TYPES[c.kind]||'Expense'}.`;
+  $('credit-card-row').classList.toggle('hidden',!isExpense);
+  if(!isExpense)$('entry-is-credit-card').checked=false;
+  const checked=isExpense&&$('entry-is-credit-card').checked;
+  $('credit-card-impact').classList.toggle('hidden',!checked);
 }
 function renderHistory(){
   const month=$('history-month').value||selectedMonth,filter=$('history-category').value,q=$('history-search').value.trim().toLocaleLowerCase();
@@ -513,6 +523,7 @@ function wire(){
   $('selected-year').addEventListener('change',()=>setMonth($('selected-year').value+'-'+$('selected-month').value));
   $('selected-month').addEventListener('change',()=>setMonth($('selected-year').value+'-'+$('selected-month').value));
   $('entry-category').addEventListener('change',entryKindLabel);
+  $('entry-is-credit-card').addEventListener('change',entryKindLabel);
   $('expense-form').addEventListener('submit',async event=>{
     event.preventDefault();if(!ready||busy)return;
     const amount=Number($('entry-amount').value),date=$('entry-date').value,categoryId=$('entry-category').value,cat=catById(categoryId);
@@ -521,7 +532,7 @@ function wire(){
     const entry={id:editingId||null,amount:Math.round(amount*100)/100,date,categoryId,note:$('entry-note').value.trim(),isCreditCard:cat.kind==='expense'&&$('entry-is-credit-card').checked};
     await writeData('saveEntry',[entry],()=>{
       selectedMonth=date.slice(0,7);followCurrentMonth=selectedMonth===localMonth(new Date());$('history-month').value=selectedMonth;clearForm();navigate('home');
-    },wasEditing?'Changes saved to Google Sheets.':'Expense saved to Google Sheets ✓');
+    },wasEditing?'Changes saved to Google Sheets.':entry.isCreditCard?'Card purchase saved: Expense + Outstanding updated (not Bill Paid).':'Expense saved to Google Sheets ✓');
   });
   $('cancel-edit').addEventListener('click',()=>{clearForm();navigate('history');});
   $('quick-repeat').addEventListener('click',event=>{const target=event.target.closest('[data-repeat]');if(!target)return;const e=data.entries.find(x=>x.id===target.dataset.repeat);if(!e)return;clearForm();$('entry-amount').value=e.amount;$('entry-category').value=e.categoryId;$('entry-note').value=e.note;$('entry-date').value=monthStartDate();entryKindLabel();window.scrollTo({top:0,behavior:'smooth'});});
