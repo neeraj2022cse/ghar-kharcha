@@ -9,7 +9,7 @@ const CAT_NAMES = [
   ['Milk','expense'],['ChatGPT Subscription','expense'],['Bike Service','expense'],
   ['Fast Food','expense'],['Medicines','expense'],['Other','expense']
 ];
-const TYPES = {expense:'Expense',investment:'Investment / Saving',transfer:'Card repayment / transfer'};
+const TYPES = {expense:'Expense',investment:'Investment / Saving',transfer:'Transfer'};
 /* V3.2 visual system: local SVG icons, no CDN / external JavaScript required. */
 const ICON_PATHS = Object.freeze({
   'house':'<path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z"/><path d="M9 21v-7h6v7"/>',
@@ -75,7 +75,7 @@ function categoryPresentation(cat){
 function categoryAvatar(cat){const view=categoryPresentation(cat);return `<span class="cat-dot icon-${view.tone}">${iconMarkup(view.icon)}</span>`;}
 
 const $=id=>document.getElementById(id);
-const defaultData=()=>({version:4,entries:[],categories:CAT_NAMES.map((c,i)=>({id:'cat_'+i,name:c[0],kind:c[1]})),plans:{},categoryBudgets:{},categoryBudgetOverrides:{}});
+const defaultData=()=>({version:5,entries:[],categories:CAT_NAMES.map((c,i)=>({id:'cat_'+i,name:c[0],kind:c[1]})),plans:{},categoryBudgets:{},categoryBudgetOverrides:{},creditCardSettings:{openingMonth:'2026-01',openingAmount:0}});
 let data=defaultData(), selectedMonth=localMonth(new Date()), currentView='home', editingId=null, toastTimer=null, busy=false, ready=false, sessionToken=null, followCurrentMonth=true, analyticsYear=new Date().getFullYear();
 const INR=new Intl.NumberFormat('en-IN',{style:'currency',currency:'INR',maximumFractionDigits:2,minimumFractionDigits:0});
 function money(n){return INR.format(Number(n)||0);}
@@ -169,7 +169,15 @@ function setBusy(on){
 }
 function acceptSnapshot(snapshot){
   if(!snapshot || !Array.isArray(snapshot.entries)||!Array.isArray(snapshot.categories)||!snapshot.plans)throw Error('Invalid response from Google Sheets.');
-  data={...snapshot,categoryBudgets:snapshot.categoryBudgets||{},categoryBudgetOverrides:snapshot.categoryBudgetOverrides||{}};ready=true;$('connection-error').classList.add('hidden');
+  // Fail closed on a mixed deployment. V3.2 UI + V3 backend silently discards card flags.
+  const caps=snapshot.capabilities||{};
+  if(Number(snapshot.version)<5 || !caps.creditCardFlag || !caps.allCategoryBudgets ||
+     !caps.cardOpeningBalance || !caps.financialReconciliation) {
+    throw Error('Outdated Apps Script backend detected. Do not record expenses until the full V3.3 code is deployed together.');
+  }
+  data={...snapshot,categoryBudgets:snapshot.categoryBudgets||{},categoryBudgetOverrides:snapshot.categoryBudgetOverrides||{},
+    creditCardSettings:snapshot.creditCardSettings||{openingMonth:'2026-01',openingAmount:0}};
+  ready=true;$('connection-error').classList.add('hidden');
 }
 async function refreshData(){
   if(busy)return;setBusy(true);
@@ -204,14 +212,15 @@ function budgetRule(id,month=selectedMonth){
 function isCardBillCategory(cat){
   return !!cat && cat.kind==='transfer' && (cat.id==='cat_12'||/^credit\s*card\s*(?:bill|payment|repayment)$/i.test(cat.name.trim()));
 }
-function eligibleForBudget(cat){return !!cat&&(cat.kind==='expense'||cat.kind==='investment'||isCardBillCategory(cat));}
+function eligibleForBudget(cat){return !!cat&&TYPES[cat.kind]!==undefined;}
+function masterBudgetEligible(cat){return !!cat&&(cat.kind==='expense'||cat.kind==='investment'||isCardBillCategory(cat));}
 // An Expense paid on a credit card is a PURCHASE, never a bill repayment.
 // The dedicated Credit Card Bill transfer category is the ONLY source of bill-paid totals.
 // Keep the conditions mutually exclusive so an inconsistent/legacy row cannot inflate Bill Paid.
 function isCardPurchase(e){return e.kind==='expense' && e.isCreditCard===true;}
 function isCardBillEntry(e){return e.kind==='transfer' && e.isCreditCard!==true && isCardBillCategory(catById(e.categoryId));}
 function expenseTotals(month=selectedMonth){
-  const totals={expense:0,investment:0,transfer:0,cardBill:0,otherTransfers:0,cardPurchases:0,master:0},by={};
+  const totals={expense:0,investment:0,transfer:0,cardBill:0,otherTransfers:0,cardPurchases:0,master:0,actualCashOutflow:0},by={};
   monthEntries(month).forEach(e=>{
     const v=Number(e.amount)||0, kind=TYPES[e.kind]?e.kind:'expense', cat=catById(e.categoryId);
     totals[kind]+=v;
@@ -221,29 +230,70 @@ function expenseTotals(month=selectedMonth){
     if(eligibleForBudget(cat))by[e.categoryId]=(by[e.categoryId]||0)+v;
   });
   totals.master=totals.expense+totals.investment+totals.cardBill;
+  totals.actualCashOutflow=totals.expense-totals.cardPurchases+totals.investment+totals.cardBill;
   return {totals,by};
 }
-/** Payments made in a month settle carried prior-month charges, not the current month's new charges.
- * This is an estimate without statement cycles; pre-tracking payments cannot create negative debt. */
+/** Opening balance = debt immediately BEFORE openingMonth starts.
+ * Current-month card purchases remain outstanding even if an older statement is paid this month.
+ * Unmatched repayment is flagged, never applied silently to new card purchases. */
 function cardBalanceAsOf(month=selectedMonth){
-  const entries=data.entries.filter(e=>validMonth(e.date.slice(0,7))&&e.date.slice(0,7)<=month);
-  const groups={};for(const e of entries){const m=e.date.slice(0,7);(groups[m]||=[]).push(e);}
-  let balance=0;let monthCharges=0;
+  const settings=data.creditCardSettings||{openingMonth:'2026-01',openingAmount:0};
+  const openingMonth=validMonth(settings.openingMonth)?settings.openingMonth:'2026-01';
+  const openingAmount=Math.max(0,Number(settings.openingAmount)||0);
+  if(month<openingMonth)return {balance:null,monthCharges:0,unmatchedPayments:0,beforeOpening:true};
+  let balance=openingAmount,monthCharges=0,unmatchedPayments=0;
+  const groups={};
+  for(const e of data.entries){const m=e.date.slice(0,7);if(m>=openingMonth&&m<=month&&validMonth(m))(groups[m]||=[]).push(e);}
   for(const m of Object.keys(groups).sort()){
     const charges=groups[m].filter(isCardPurchase).reduce((n,e)=>n+Number(e.amount||0),0);
     const payments=groups[m].filter(isCardBillEntry).reduce((n,e)=>n+Number(e.amount||0),0);
+    if(payments>balance)unmatchedPayments+=payments-balance;
     balance=Math.max(0,balance-payments)+charges;
     if(m===month)monthCharges=charges;
   }
-  return {balance:Math.round(balance*100)/100,monthCharges:Math.round(monthCharges*100)/100};
+  const round=n=>Math.round(n*100)/100;
+  return {balance:round(balance),monthCharges:round(monthCharges),unmatchedPayments:round(unmatchedPayments),beforeOpening:false};
 }
+/** Full category plan is usable as Master Budget only when every Master category has a rule.
+ * A user-entered monthly overall budget is an explicit fallback if category coverage is partial.
+ * Self-transfers may have category budgets, but never inflate Master Total or Master Budget. */
 function effectiveOverallBudget(month=selectedMonth){
+  const master=data.categories.filter(masterBudgetEligible);
+  const configured=master.map(c=>budgetRule(c.id,month).value);
+  const count=configured.filter(v=>v!==null).length,total=master.length;
+  const partialValue=configured.reduce((n,v)=>n+(v===null?0:v),0);
+  const allCovered=total>0&&count===total;
   const p=data.plans[month]||{};
-  const configured=data.categories.filter(eligibleForBudget).map(c=>budgetRule(c.id,month).value).filter(v=>v!==null);
-  // Category budgets take precedence once configured, so investments + Card Bill count in the planned line.
-  if(configured.length)return {value:configured.reduce((a,b)=>a+b,0),label:'Total category budget'};
-  if(p.budget!==undefined&&p.budget!==''&&Number(p.budget)>=0)return {value:Number(p.budget),label:'Monthly overall budget'};
-  return {value:null,label:'Budget not set'};
+  if(allCovered)return {value:partialValue,label:'Full category budget',source:'categories',count,total,partialValue,complete:true};
+  if(p.budget!==undefined&&p.budget!==''&&Number.isFinite(Number(p.budget))&&Number(p.budget)>=0)
+    return {value:Number(p.budget),label:'Monthly overall budget',source:'monthly',count,total,partialValue,complete:true};
+  return {value:null,label:'Budget incomplete',source:'partial',count,total,partialValue,complete:false};
+}
+
+/** Breakdown budget for one of three Master groups. Never imply missing category budgets are zero. */
+function masterGroupBudget(group,month=selectedMonth){
+  const categories=data.categories.filter(c=>group==='expense'?c.kind==='expense':group==='investment'?c.kind==='investment':isCardBillCategory(c));
+  const rules=categories.map(c=>budgetRule(c.id,month).value);
+  const covered=rules.filter(v=>v!==null).length;
+  return {total:categories.length,covered,value:categories.length>0&&covered===categories.length?rules.reduce((n,v)=>n+v,0):null};
+}
+/** Bar shape: under budget = green portion + neutral remaining. Over budget = green limit / spent + red excess / spent. */
+function progressParts(spent,limit){
+  if(limit===null||!Number.isFinite(Number(limit)))return {green:0,red:0,unplanned:true};
+  const actual=Math.max(0,Number(spent)||0), cap=Math.max(0,Number(limit)||0);
+  if(actual===0)return {green:0,red:0,unplanned:false};
+  if(cap===0)return {green:0,red:100,unplanned:false};
+  if(actual<=cap)return {green:Math.min(100,actual/cap*100),red:0,unplanned:false};
+  return {green:cap/actual*100,red:(actual-cap)/actual*100,unplanned:false};
+}
+function budgetProgressMarkup(spent,limit,label='Category budget'){
+  const parts=progressParts(spent,limit);
+  const text=parts.unplanned?`${label} not set`:`${label} ${money(limit)}; actual ${money(spent)}${spent>limit?'; over by '+money(spent-limit):''}`;
+  return `<div class="cat-bar segmented-progress${parts.unplanned?' budget-not-set':''}" role="img" aria-label="${esc(text)}"><i class="progress-within" style="width:${parts.green.toFixed(2)}%"></i><i class="progress-over" style="width:${parts.red.toFixed(2)}%"></i></div>`;
+}
+function groupedBudgetLabel(actual,group){
+  const b=masterGroupBudget(group);
+  return `${money(actual)} <span class="budget-slash">/</span> <span class="breakdown-limit" title="${b.value===null?'Some category budgets have not been set':'Full group budget'}">${b.value===null?'Not set':money(b.value)}</span>`;
 }
 
 function renderDashboard(){
@@ -252,12 +302,17 @@ function renderDashboard(){
   const {totals,by}=expenseTotals(), p=currentPlan(),overall=effectiveOverallBudget();
   $('total-spending').textContent=money(totals.master);
   $('month-transactions').textContent=`${list.length} recorded entr${list.length===1?'y':'ies'}`;
-  $('breakdown-expenses').textContent=money(totals.expense);
-  $('breakdown-investments').textContent=money(totals.investment);
-  $('breakdown-card-bill').textContent=money(totals.cardBill);
+  $('breakdown-expenses').innerHTML=groupedBudgetLabel(totals.expense,'expense');
+  $('breakdown-investments').innerHTML=groupedBudgetLabel(totals.investment,'investment');
+  $('breakdown-card-bill').innerHTML=groupedBudgetLabel(totals.cardBill,'cardBill');
   const card=cardBalanceAsOf();
-  $('card-outstanding').textContent=money(card.balance);
+  $('card-outstanding').textContent=card.balance===null?'—':money(card.balance);
   $('card-month-charges').textContent=money(card.monthCharges);
+  const cardHealth=$('card-reconciliation-note');
+  cardHealth.textContent=card.beforeOpening?`Tracking begins ${prettyMonth(data.creditCardSettings.openingMonth)}.`:
+    card.unmatchedPayments>0?`${money(card.unmatchedPayments)} repayments have no matching tracked prior balance. Check opening outstanding / older entries.`:
+    'Estimated from recorded purchases, repayments and any opening balance.';
+  cardHealth.classList.toggle('is-over',card.unmatchedPayments>0);
   if(overall.value!==null && overall.value>0){
     const ratio=totals.master/overall.value;
     $('budget-status').textContent=`${overall.label}: ${money(overall.value)}`;
@@ -268,27 +323,32 @@ function renderDashboard(){
     $('budget-status').textContent=overall.value===0?'Zero budget':'Set budgets';
     $('budget-bar').style.width=overall.value===0&&totals.master>0?'100%':'0%';
     $('budget-bar').style.background='#e37c84';
-    $('hero-foot').textContent=overall.value===0&&totals.master>0?'Total recorded exceeds your zero budget':'Set category budgets to track your monthly plan.';
+    $('hero-foot').textContent=overall.value===0&&totals.master>0?'Total recorded exceeds your zero budget':
+      `Category budgets cover ${overall.count}/${overall.total} Master categories (${money(overall.partialValue)} planned). Add an overall monthly budget or finish category planning.`;
   }
   const hasIncome=p.income!==undefined&&p.income!==''&&Number.isFinite(Number(p.income));
   const projected=hasIncome&&overall.value!==null ? Number(p.income)-overall.value : null;
   $('planned-savings').classList.toggle('hidden',projected===null);
-  $('planned-savings').textContent=projected===null?'':`Planned savings after budget: ${money(projected)}`;
+  $('planned-savings').textContent=projected===null?'':`Planned savings (salary − complete planned budget): ${money(projected)}`;
+  $('budget-coverage').textContent=`${overall.count} of ${overall.total} Master categories budgeted${overall.source==='monthly'?' · using monthly overall budget':overall.complete?' · full coverage':' · partial plan'}`;
   $('income-total').textContent=p.income!==undefined&&p.income!==''?money(p.income):'—';
   $('investment-total').textContent=money(totals.investment);
   $('transfer-total').textContent=money(totals.cardBill);
   const remain=p.income!==undefined&&p.income!==''?Number(p.income)-totals.master:null;
   $('cash-left').textContent=remain!==null?money(remain):'—';
   $('cash-left').classList.toggle('negative',remain!==null&&remain<0);
+  const outflow=totals.actualCashOutflow,bankEstimate=hasIncome?Number(p.income)-outflow:null;
+  $('cash-outflow').textContent=money(outflow);
+  $('bank-left-estimate').textContent=bankEstimate===null?'—':money(bankEstimate);
+  $('bank-left-estimate').classList.toggle('negative',bankEstimate!==null&&bankEstimate<0);
   const groups=data.categories.filter(eligibleForBudget).map(c=>({id:c.id,spent:by[c.id]||0,rule:budgetRule(c.id)})).filter(v=>v.spent>0||v.rule.value!==null).sort((a,b)=>{
     const ae=a.rule.value!==null&&a.spent>a.rule.value,be=b.rule.value!==null&&b.spent>b.rule.value;
     return Number(be)-Number(ae)||b.spent-a.spent;
   });
   $('category-breakdown').innerHTML=groups.length?groups.slice(0,5).map(({id,spent,rule})=>{
     const over=rule.value!==null&&spent>rule.value;
-    const pct=rule.value===null?0:rule.value===0?(spent>0?100:0):Math.min(100,spent/rule.value*100);
     const label=rule.value===null?'No budget set':`${money(rule.value)} limit · ${over?money(spent-rule.value)+' over':money(rule.value-spent)+' left'}`;
-    return `<div class="cat-row" role="button" tabindex="0" data-history-category="${esc(id)}">${categoryAvatar(catById(id))}<div class="cat-info"><div class="cat-title"><span>${esc(catById(id).name)}</span><b class="cat-amount">${money(spent)}</b></div><div class="budget-subline"><span>${esc(label)}</span><span class="${over?'over':'ok'}">${rule.value!==null?(over?'Over budget':'On track'):''}</span></div><div class="cat-bar"><i class="${over?'over':rule.value===null?'neutral':''}" style="width:${pct.toFixed(2)}%"></i></div></div></div>`;
+    return `<div class="cat-row" role="button" tabindex="0" data-history-category="${esc(id)}">${categoryAvatar(catById(id))}<div class="cat-info"><div class="cat-title"><span>${esc(catById(id).name)}</span><b class="cat-amount">${money(spent)}</b></div><div class="budget-subline"><span>${esc(label)}</span><span class="${over?'over':'ok'}">${rule.value!==null?(over?'Over budget':'On track'):''}</span></div>${budgetProgressMarkup(spent,rule.value)}</div></div>`;
   }).join(''):'<p class="empty-state">No tracked category budgets yet.<br>Set one in Manage all to get started.</p>';
   const recent=[...list].sort(byRecent).slice(0,4);
   $('recent-list').innerHTML=recent.length?recent.map(e=>txMarkup(e)).join(''):'<p class="empty-state">No entries for this month yet.</p>';
@@ -296,7 +356,8 @@ function renderDashboard(){
 function byRecent(a,b){return b.date.localeCompare(a.date)||(b.createdAt||'').localeCompare(a.createdAt||'');}
 function txMarkup(e,actions=false){
   const c=catById(e.categoryId),label=e.note||c.name,k=e.kind||c.kind;
-  return `<div class="transaction">${categoryAvatar(c)}<div class="tx-main"><strong>${esc(label)}</strong><small>${esc(c.name)} · ${prettyDate(e.date)} · ${TYPES[k]||'Expense'}${isCardPurchase(e)?' · 💳 Card purchase':''}</small></div><span class="tx-amount">${money(e.amount)}</span>${actions?`<button class="tx-action" title="Edit" aria-label="Edit transaction" data-edit="${esc(e.id)}">${iconMarkup('pencil')}</button><button class="tx-action" title="Delete" aria-label="Delete transaction" data-delete="${esc(e.id)}">${iconMarkup('trash-2')}</button>`:''}</div>`;
+  const typeLabel=isCardBillEntry(e)?'Credit card bill repayment':(TYPES[k]||'Expense');
+  return `<div class="transaction">${categoryAvatar(c)}<div class="tx-main"><strong>${esc(label)}</strong><small>${esc(c.name)} · ${prettyDate(e.date)} · ${typeLabel}${isCardPurchase(e)?' · 💳 Card purchase':''}</small></div><span class="tx-amount">${money(e.amount)}</span>${actions?`<button class="tx-action" title="Edit" aria-label="Edit transaction" data-edit="${esc(e.id)}">${iconMarkup('pencil')}</button><button class="tx-action" title="Delete" aria-label="Delete transaction" data-delete="${esc(e.id)}">${iconMarkup('trash-2')}</button>`:''}</div>`;
 }
 function renderCategorySelects(){
   const pick=$('entry-category'),hPick=$('history-category'),keep=pick.value,filter=hPick.value;
@@ -371,12 +432,14 @@ function renderBudgets(){
   $('all-category-budgets').innerHTML=cats.map(c=>{
     const spent=by[c.id]||0,rule=budgetRule(c.id),over=rule.value!==null&&spent>rule.value;
     const remaining=rule.value===null?null:rule.value-spent;
-    const pct=rule.value===null?0:rule.value===0?(spent>0?100:0):Math.min(100,100*spent/rule.value);
-    return `<div class="budget-item" data-budget-pick="${esc(c.id)}" role="button" tabindex="0"><div class="budget-item-head"><div><strong>${esc(c.name)}</strong><small>${rule.value===null?'Not configured':rule.source==='month'?'Monthly override':'Default budget'}</small></div><div class="budget-item-right">${money(spent)} / ${rule.value===null?'—':money(rule.value)}<small class="${over?'is-over':'is-good'}">${remaining===null?'Tap to set a budget':remaining<0?money(-remaining)+' over':money(remaining)+' remaining'}</small></div></div><div class="cat-bar"><i class="${over?'over':rule.value===null?'neutral':''}" style="width:${pct.toFixed(2)}%"></i></div></div>`;
+    return `<div class="budget-item" data-budget-pick="${esc(c.id)}" role="button" tabindex="0"><div class="budget-item-head"><div><strong>${esc(c.name)}</strong><small>${rule.value===null?'Not configured':rule.source==='month'?'Monthly override':'Default budget'}</small></div><div class="budget-item-right">${money(spent)} / ${rule.value===null?'—':money(rule.value)}<small class="${over?'is-over':'is-good'}">${remaining===null?'Tap to set a budget':remaining<0?money(-remaining)+' over':money(remaining)+' remaining'}</small></div></div>${budgetProgressMarkup(spent,rule.value)}</div>`;
   }).join('');
   budgetFormSync();
 }
 function renderPlan(){
+  const c=data.creditCardSettings||{openingMonth:'2026-01',openingAmount:0};
+  $('card-opening-month').value=c.openingMonth;
+  $('card-opening-amount').value=c.openingAmount;
   $('plan-month').value=selectedMonth;const p=currentPlan();
   $('plan-income').value=p.income!==undefined?p.income:'';
   $('plan-budget').value=p.budget!==undefined?p.budget:'';
@@ -388,10 +451,10 @@ function renderAnalytics(){
   const yearEl=$('analytics-year'),lastYear=Math.max(new Date().getFullYear()+1,Number(selectedMonth.slice(0,4))+1,analyticsYear+1);
   yearEl.innerHTML=Array.from({length:lastYear-FIRST_YEAR+1},(_,i)=>`<option value="${FIRST_YEAR+i}">${FIRST_YEAR+i}</option>`).join('');
   yearEl.value=String(analyticsYear);
-  renderDonut();renderBudgetBars();renderAnnual();
+  renderDonut();renderBudgetBars();renderAnnual();renderAnnualColumns();
 }
 function renderDonut(){
-  const by=expenseTotals().by,groups=Object.entries(by).filter(p=>p[1]>0).sort((a,b)=>b[1]-a[1]);
+  const by=expenseTotals().by,groups=Object.entries(by).filter(([id,value])=>value>0&&masterBudgetEligible(catById(id))).sort((a,b)=>b[1]-a[1]);
   const total=groups.reduce((a,p)=>a+p[1],0);
   if(!total){$('donut-chart').innerHTML='<p class="empty-state">No spending recorded for this month yet.</p>';return;}
   const head=groups.slice(0,5).map(p=>({name:catById(p[0]).name,value:p[1]}));
@@ -413,7 +476,7 @@ function renderBudgetBars(){
   $('budget-chart').innerHTML=`<div class="budget-bars">${rows.slice(0,7).map(({cat,spent,limit})=>{
     const max=Math.max(spent,limit,1),over=spent>limit;
     return `<div class="bar-item"><div class="bar-item-head"><span>${esc(cat.name)}</span><b class="${over?'is-over':''}">${money(spent)} / ${money(limit)}</b></div><div class="bar-tracks"><div class="bar-track"><span class="bar-fill" style="width:${(limit/max*100).toFixed(1)}%"></span></div><div class="bar-track"><span class="bar-fill actual ${over?'over':''}" style="width:${(spent/max*100).toFixed(1)}%"></span></div></div></div>`;
-  }).join('')}</div><p class="chart-label-note">Blue = budget · Green = actual · Red = over budget. ${rows.length>7?'Showing top 7 categories.':''}</p>`;
+  }).join('')}</div><p class="chart-label-note">${rows.length>7?'Showing top 7 categories.':''}</p>`;
 }
 function renderAnnual(){
   const yr=analyticsYear,points=MONTH_OPTIONS.map((name,i)=>{
@@ -441,6 +504,52 @@ function renderAnnual(){
   const ticks=points.map((p,i)=>`<text x="${x(i).toFixed(1)}" y="${H-9}" text-anchor="middle" font-size="8.4" fill="#81938E">${p.name}</text>`).join('');
   $('annual-chart').innerHTML=`<svg role="img" aria-label="Year ${yr} monthly spending and budget trend" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${axes}${paths}${ticks}</svg><p class="chart-label-note">Missing months are left blank, not treated as zero. Yearly values are based on recorded entries.</p>`;
 }
+/** Stacked year chart: same analytics-year selector as the existing line chart. */
+function renderAnnualColumns(){
+  const yr=analyticsYear;
+  const months=MONTH_OPTIONS.map((name,i)=>{
+    const key=`${yr}-${String(i+1).padStart(2,'0')}`;
+    const entries=monthEntries(key);
+    const totals=entries.length?expenseTotals(key).totals:null;
+    return {name:name.slice(0,3),key,totals};
+  });
+  const out=$('annual-columns-chart');
+  if(!out)return;
+  if(months.every(m=>m.totals===null)){
+    out.innerHTML='<p class="empty-state">No recorded entries for this year yet. Choose another year when you have records.</p>';
+    return;
+  }
+  const W=352,H=220,left=32,right=10,top=14,bottom=37;
+  const plotH=H-top-bottom, plotW=W-left-right;
+  const total=m=>m.totals?m.totals.expense+m.totals.investment+m.totals.cardBill:0;
+  const max=Math.max(1,...months.map(total));
+  const unit=max>100000?25000:max>20000?5000:max>5000?1000:max>1000?500:100;
+  const ceiling=Math.ceil(max/unit)*unit;
+  const fmt=v=>v>=100000?`${+(v/100000).toFixed(1)}L`:v>=1000?`${+(v/1000).toFixed(1)}k`:String(Math.round(v));
+  const colors=[['expense','#2FA883'],['investment','#8278D3'],['cardBill','#D9A053']];
+  const baseline=top+plotH;
+  const axes=[0,.5,1].map(t=>{const yy=(baseline-t*plotH).toFixed(2);return `<line x1="${left}" y1="${yy}" x2="${W-right}" y2="${yy}" stroke="#E6EEE9" stroke-dasharray="3 3"/><text x="${left-5}" y="${Number(yy)+3}" text-anchor="end" font-size="9" fill="#789186">${fmt(ceiling*t)}</text>`;}).join('');
+  const step=plotW/12,barWidth=Math.min(16,step*.64);
+  let bars='';
+  for(let i=0;i<months.length;i++){
+    const m=months[i],x=left+i*step+(step-barWidth)/2;
+    if(m.totals){
+      let stacked=0;
+      for(const [key,color] of colors){
+        const value=Math.max(0,Number(m.totals[key])||0);
+        if(value===0)continue;
+        const h=value/ceiling*plotH;
+        const y=baseline-(stacked+h);
+        bars+=`<rect x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${barWidth.toFixed(2)}" height="${Math.max(.4,h).toFixed(2)}" rx="1.5" fill="${color}"><title>${esc(m.name)} ${yr} · ${key==='cardBill'?'Card Bill Paid':key==='investment'?'Investments':'Expenses'}: ${money(value)} · Master total: ${money(total(m))}</title></rect>`;
+        stacked+=h;
+      }
+      if(total(m)===0)bars+=`<circle cx="${(x+barWidth/2).toFixed(2)}" cy="${baseline}" r="2" fill="#A2B9AE"><title>${esc(m.name)} ${yr}: no Master spending (other transfers only)</title></circle>`;
+    }
+    bars+=`<text x="${(x+barWidth/2).toFixed(2)}" y="${H-14}" text-anchor="middle" font-size="8.4" fill="#738C82">${m.name}</text>`;
+  }
+  out.innerHTML=`<svg role="img" aria-label="Stacked monthly expenses, investments and card bills for ${yr}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${axes}${bars}</svg><p class="chart-label-note">Only months with records have bars. Tap/press a segment to see its amount on supported devices.</p>`;
+}
+
 function navigate(view){
   currentView=view;document.querySelectorAll('.view').forEach(el=>el.classList.toggle('hidden',el.id!==view+'-view'));
   document.querySelectorAll('.nav-item').forEach(el=>el.classList.toggle('active',el.dataset.nav===view));
@@ -476,7 +585,15 @@ function cleanImported(raw){
   const cleanedOverrides={};for(const [m,values] of Object.entries(overrides))if(validMonth(m)&&values&&typeof values==='object'&&!Array.isArray(values)){
     cleanedOverrides[m]={};for(const [id,n] of Object.entries(values))if(expenseIds.has(id)&&Number.isFinite(Number(n))&&Number(n)>=0)cleanedOverrides[m][id]=Number(n);
   }
-  return {version:4,entries,categories,plans,categoryBudgets:cleanedDefaults,categoryBudgetOverrides:cleanedOverrides};
+  let creditCardSettings;
+  if(raw.creditCardSettings!==undefined){
+    const c=raw.creditCardSettings;
+    if(!c||!validMonth(c.openingMonth)||Number(c.openingMonth.slice(0,4))<FIRST_YEAR||
+       !Number.isFinite(Number(c.openingAmount))||Number(c.openingAmount)<0)throw Error('Invalid card opening settings in backup.');
+    creditCardSettings={openingMonth:c.openingMonth,openingAmount:Number(c.openingAmount)};
+  }
+  return {version:5,entries,categories,plans,categoryBudgets:cleanedDefaults,categoryBudgetOverrides:cleanedOverrides,
+    ...(creditCardSettings?{creditCardSettings}:{})};
 }
 async function readFile(file){if(!file)return '';if(file.size>15*1024*1024)throw Error('File exceeds the 15 MB import limit.');return await file.text();}
 function parseCSV(raw){
@@ -517,7 +634,9 @@ function wire(){
   $('pin-form').addEventListener('submit',unlockWithPin);
   document.querySelectorAll('[data-nav]').forEach(el=>el.addEventListener('click',()=>{if(el.dataset.nav==='add'&&editingId)clearForm();navigate(el.dataset.nav);}));
   $('brand-home').addEventListener('click',()=>navigate('home'));
-  $('analytics-year').addEventListener('change',()=>{analyticsYear=Number($('analytics-year').value);renderAnnual();});
+  $('snapshot-history').addEventListener('click',()=>{$('history-month').value=selectedMonth;$('history-category').value='';$('history-search').value='';navigate('history');});
+  $('snapshot-history').addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();$('snapshot-history').click();}});
+  $('analytics-year').addEventListener('change',()=>{analyticsYear=Number($('analytics-year').value);renderAnnual();renderAnnualColumns();});
   $('prev-month').addEventListener('click',()=>shiftMonth(-1));$('next-month').addEventListener('click',()=>shiftMonth(1));
   $('this-month').addEventListener('click',()=>{setMonth(localMonth(new Date()),true);if(!editingId)$('entry-date').value=monthStartDate();});
   $('selected-year').addEventListener('change',()=>setMonth($('selected-year').value+'-'+$('selected-month').value));
@@ -550,6 +669,13 @@ function wire(){
     }
   });
   $('plan-month').addEventListener('change',()=>{if(!validMonth($('plan-month').value))return;setMonth($('plan-month').value);});
+  $('card-opening-form').addEventListener('submit',async event=>{
+    event.preventDefault();const month=$('card-opening-month').value,amount=Number($('card-opening-amount').value);
+    if(!validMonth(month)||Number(month.slice(0,4))<FIRST_YEAR||!Number.isFinite(amount)||amount<0){toast('Enter a valid opening month and amount.');return;}
+    const older=data.entries.filter(e=>isCardPurchase(e)&&e.date.slice(0,7)<month).length;
+    if(older&&!confirm(`${older} earlier card purchases are before this opening month and will not be counted by the outstanding estimate. Continue?`))return;
+    await writeData('saveCreditCardOpening',[month,amount],null,'Opening card balance saved to Google Sheets.');
+  });
   $('monthly-settings-form').addEventListener('submit',async event=>{
     event.preventDefault();const inc=$('plan-income').value,bdg=$('plan-budget').value;
     if(inc!==''&&(!Number.isFinite(Number(inc))||Number(inc)<0)){toast('Invalid income.');return;}
