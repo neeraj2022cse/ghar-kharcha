@@ -8,11 +8,12 @@
 'use strict';
 
 const SHEETS = Object.freeze({
-  transactions: ['ID', 'Date', 'CategoryID', 'Amount', 'Note', 'Type', 'CreatedAt', 'UpdatedAt'],
+  transactions: ['ID', 'Date', 'CategoryID', 'Amount', 'Note', 'Type', 'CreatedAt', 'UpdatedAt', 'IsCreditCard'],
   categories: ['ID', 'Name', 'Type'],
   plans: ['Month', 'Income', 'Budget'],
   categoryBudgets: ['CategoryID', 'Budget'],
-  categoryBudgetOverrides: ['Month', 'CategoryID', 'Budget']
+  categoryBudgetOverrides: ['Month', 'CategoryID', 'Budget'],
+  creditCardSettings: ['Key', 'Value']
 });
 const SEED_CATEGORIES = [
   ['Plot EMI','expense'], ['Wifi','expense'], ['Gas','expense'],
@@ -103,6 +104,7 @@ function setupDatabase() {
   if (savedId && savedId !== active.getId()) throw Error('Already configured for a different Sheet. Refusing to switch silently.');
   PropertiesService.getScriptProperties().setProperty('GHAR_KHARCHA_SHEET_ID', active.getId());
   const ss = SpreadsheetApp.openById(active.getId());
+  ensureTransactionsSchema_(ss);
   Object.keys(SHEETS).forEach(key => {
     const name = sheetName_(key);
     let tab = ss.getSheetByName(name);
@@ -132,7 +134,28 @@ function setupDatabase() {
   return 'Setup completed.';
 }
 
-function sheetName_(key) { return {transactions:'Transactions', categories:'Categories', plans:'Plans',categoryBudgets:'CategoryBudgets',categoryBudgetOverrides:'CategoryBudgetOverrides'}[key]; }
+/** Upgrade V3's eight-column Transactions table in place; never rewrite historical entries. */
+function ensureTransactionsSchema_(ss) {
+  const sh=ss.getSheetByName('Transactions');
+  if(!sh || sh.getLastRow()===0) return; // setupDatabase creates it below
+  const old=SHEETS.transactions.slice(0,8), actual=sh.getRange(1,1,1,8).getDisplayValues()[0];
+  if(actual.join('|')!==old.join('|')) throw Error('Unexpected Transactions headers. Backup and inspect before upgrading.');
+  if(sh.getMaxColumns()<9) sh.insertColumnsAfter(sh.getMaxColumns(),9-sh.getMaxColumns());
+  const extra=sh.getRange(1,9).getDisplayValue();
+  if(extra && extra!=='IsCreditCard') throw Error('Transactions column I is already in use. No changes made.');
+  if(!extra) sh.getRange(1,9).setValue('IsCreditCard').setFontWeight('bold').setBackground('#dff3e8');
+}
+function isCardBillCategory_(category) {
+  return !!category && category.kind==='transfer' && (category.id==='cat_12' || /^credit\s*card\s*(?:bill|payment|repayment)$/i.test(String(category.name).trim()));
+}
+// Any category may have a planning budget, including non-card transfers.
+// Only expenses, investments, and card-bill repayments count in Master Total.
+function budgetEligible_(category) { return !!category && allowedType_(category.kind); }
+function masterBudgetEligible_(category) {
+  return !!category && (category.kind === 'expense' || category.kind === 'investment' || isCardBillCategory_(category));
+}
+function cardFlag_(v) { return v === true || v === 1 || /^(true|yes|1)$/i.test(String(v == null ? '' : v).trim()); }
+function sheetName_(key) { return {transactions:'Transactions', categories:'Categories', plans:'Plans',categoryBudgets:'CategoryBudgets',categoryBudgetOverrides:'CategoryBudgetOverrides',creditCardSettings:'CreditCardSettings'}[key]; }
 function ensureBudgetSheets_(ss) {
   ['categoryBudgets','categoryBudgetOverrides'].forEach(key => {
     const name=sheetName_(key), headers=SHEETS[key];
@@ -143,12 +166,37 @@ function ensureBudgetSheets_(ss) {
   });
 }
 
+// Additive, non-destructive migration. Store outstanding BEFORE the opening month.
+function ensureCreditCardSettingsSheet_(ss) {
+  const headers = SHEETS.creditCardSettings;
+  let tab = ss.getSheetByName('CreditCardSettings');
+  if (!tab) tab = ss.insertSheet('CreditCardSettings');
+  if (tab.getLastRow() === 0) {
+    tab.getRange(1,1,1,headers.length).setValues([headers]);
+    tab.getRange(1,1,1,headers.length).setFontWeight('bold').setBackground('#dff3e8');
+    tab.setFrozenRows(1);
+  } else if (tab.getRange(1,1,1,headers.length).getDisplayValues()[0].join('|') !== headers.join('|')) {
+    throw Error('Unexpected CreditCardSettings header; no data changed.');
+  }
+}
+function cardOpening_(ss) {
+  const rows = readRows_(ss, 'creditCardSettings').filter(r => r[0]);
+  const known = new Map(rows.map(r => [r[0],r[1]]));
+  const openingMonth = known.has('OpeningMonth') ? String(known.get('OpeningMonth')) : '2026-01';
+  const openingAmount = known.has('OpeningAmount') ? Number(String(known.get('OpeningAmount')).replace(/,/g,'')) : 0;
+  if (!isMonth_(openingMonth) || Number(openingMonth.slice(0,4)) < 2026 || !Number.isFinite(openingAmount) || openingAmount < 0) {
+    throw Error('Invalid CreditCardSettings values. Review the private Sheet.');
+  }
+  return {openingMonth,openingAmount};
+}
 function db_() {
   const id = PropertiesService.getScriptProperties().getProperty('GHAR_KHARCHA_SHEET_ID');
   if (!id) throw Error('Database not configured. Run setupDatabase from the Apps Script editor once.');
   const ss=SpreadsheetApp.openById(id);
-  // Add only the two new V3 budget tabs automatically; existing records stay untouched.
+  // Upgrade additive column only; existing rows and values are preserved.
+  ensureTransactionsSchema_(ss);
   ensureBudgetSheets_(ss);
+  ensureCreditCardSettingsSheet_(ss);
   return ss;
 }
 function readRows_(ss, key) {
@@ -198,7 +246,7 @@ function snapshot_(ss) {
   }));
   const entries = readRows_(ss, 'transactions').filter(r => r[0] && isDate_(r[1])).map(r => ({
     id:r[0],date:r[1],categoryId:r[2],amount:Number(String(r[3]).replace(/,/g,''))||0,
-    note:r[4]||'',kind:allowedType_(r[5])?r[5]:'expense',createdAt:r[6]||'',updatedAt:r[7]||''
+    note:r[4]||'',kind:allowedType_(r[5])?r[5]:'expense',createdAt:r[6]||'',updatedAt:r[7]||'',isCreditCard:cardFlag_(r[8])
   }));
   const plans = {};
   readRows_(ss, 'plans').forEach(r => {
@@ -220,7 +268,12 @@ function snapshot_(ss) {
       categoryBudgetOverrides[r[0]][r[1]]=Number(String(r[2]).replace(/,/g,''));
     }
   });
-  return {version:3, entries:entries, categories:categories, plans:plans, categoryBudgets, categoryBudgetOverrides};
+  return {
+    version:5,
+    capabilities:{creditCardFlag:true,allCategoryBudgets:true,cardOpeningBalance:true,financialReconciliation:true},
+    entries, categories, plans, categoryBudgets, categoryBudgetOverrides,
+    creditCardSettings:cardOpening_(ss)
+  };
 }
 /** Called on app startup and by Refresh. */
 function getAppData(session) { requireSession_(session); return snapshot_(db_()); }
@@ -238,6 +291,10 @@ function saveEntry(session, raw) {
     const amount = asNumber_(raw.amount, 'amount', 999999999);
     if (amount <= 0) throw Error('Amount must be greater than zero.');
     const note = text_(raw.note, 160, 'note', false);
+    // The checkbox applies ONLY to actual expense purchases, not investments or bill repayments.
+    if(raw.isCreditCard !== undefined && typeof raw.isCreditCard !== 'boolean') throw Error('Invalid credit card flag.');
+    const isCreditCard = category.kind==='expense' && raw.isCreditCard===true;
+    if(raw.isCreditCard===true && category.kind!=='expense') throw Error('Credit card payment method is allowed only on Expense entries.');
     const sh = ss.getSheetByName('Transactions');
     const id = raw.id ? text_(raw.id, 100, 'ID', true) : guid_();
     const rows = readRows_(ss, 'transactions');
@@ -245,11 +302,19 @@ function saveEntry(session, raw) {
     if (raw.id && rowIndex < 0) throw Error('Entry no longer exists. Refresh.');
     if (!raw.id && rows.length >= MAX_ENTRIES) throw Error('Entry limit reached. Export your data before archiving.');
     const created = rowIndex < 0 ? stamp_() : rows[rowIndex][6];
-    const values = [safeCell_(id),date,safeCell_(categoryId),amount,safeCell_(note),category.kind,created,stamp_()];
+    const values = [safeCell_(id),date,safeCell_(categoryId),amount,safeCell_(note),category.kind,created,stamp_(),isCreditCard?'TRUE':'FALSE'];
     if (rowIndex < 0) sh.appendRow(values);
-    else sh.getRange(rowIndex + 2, 1, 1, 8).setValues([values]);
+    else sh.getRange(rowIndex + 2, 1, 1, 9).setValues([values]);
     SpreadsheetApp.flush();
-    return snapshot_(ss);
+    // Verify the actual persisted Sheet value before telling the user that a card purchase was saved.
+    const persisted = sh.getRange(rowIndex < 0 ? sh.getLastRow() : rowIndex+2,9).getDisplayValue();
+    if (cardFlag_(persisted) !== isCreditCard) {
+      throw Error('Credit card flag could not be verified in Google Sheets. Refresh and inspect the transaction.');
+    }
+    const fresh = snapshot_(ss);
+    const saved = fresh.entries.find(e=>e.id===id);
+    if (!saved || saved.isCreditCard !== isCreditCard) throw Error('Saved entry did not match the requested payment method. Refresh the app.');
+    return fresh;
   });
 }
 function snapshotCategories_(ss) {
@@ -305,7 +370,7 @@ function updateCategory(session, id, name, kind) {
     if(cats.some(c=>c.id!==cleanId && c.name.toLowerCase()===clean.toLowerCase()))throw Error('Category name already exists.');
     const old=cats.find(c=>c.id===cleanId);
     if(old.kind!==kind && readRows_(ss,'transactions').some(r=>r[2]===cleanId))throw Error('This category has transactions. Its type cannot change; its name can be edited.');
-    if(old.kind==='expense'&&kind!=='expense'){
+    if(budgetEligible_(old)&&!budgetEligible_({...old,kind,name:clean})){ 
       const defaults=readRows_(ss,'categoryBudgets');
       const overrides=readRows_(ss,'categoryBudgetOverrides');
       if(defaults.some(r=>r[0]===cleanId)||overrides.some(r=>r[1]===cleanId))throw Error('Remove this category’s budget settings before changing its type.');
@@ -320,7 +385,7 @@ function saveCategoryBudget(session, categoryId, scope, month, value) {
   return lockRun_(function() {
     const ss=db_(), id=text_(categoryId,100,'category ID',true);
     const cat=snapshotCategories_(ss).find(c=>c.id===id);
-    if(!cat || cat.kind!=='expense')throw Error('Only expense categories can have spending budgets.');
+    if(!budgetEligible_(cat))throw Error('Budgets support expense, investment and transfer categories.');
     if(scope!=='default'&&scope!=='month')throw Error('Invalid budget scope.');
     if(scope==='month'&&!isMonth_(month))throw Error('Invalid month.');
     const clear=value===''||value===null||typeof value==='undefined';
@@ -337,6 +402,23 @@ function saveCategoryBudget(session, categoryId, scope, month, value) {
   });
 }
 
+/** Opening outstanding just BEFORE a selected month begins, not a new expense. */
+function saveCreditCardOpening(session, openingMonth, amount) {
+  requireSession_(session);
+  return lockRun_(function() {
+    if (!isMonth_(openingMonth) || Number(openingMonth.slice(0,4)) < 2026) throw Error('Invalid opening month.');
+    const clean = asNumber_(amount, 'opening outstanding', 999999999);
+    const ss = db_(), sh = ss.getSheetByName('CreditCardSettings'), rows = readRows_(ss,'creditCardSettings');
+    const settings = [['OpeningMonth',openingMonth],['OpeningAmount',String(clean)]];
+    settings.forEach(([key,value]) => {
+      const i=rows.findIndex(r=>r[0]===key);
+      if(i>=0)sh.getRange(i+2,1,1,2).setValues([[key,value]]);
+      else sh.appendRow([key,value]);
+    });
+    SpreadsheetApp.flush();
+    return snapshot_(ss);
+  });
+}
 function validateSnapshot_(raw) {
   if (!raw || !Array.isArray(raw.entries) || !Array.isArray(raw.categories) || !raw.plans || Array.isArray(raw.plans) || typeof raw.plans !== 'object') throw Error('Invalid backup format.');
   if (raw.entries.length > MAX_ENTRIES || raw.categories.length > 150) throw Error('Backup is too large.');
@@ -353,8 +435,11 @@ function validateSnapshot_(raw) {
     uniqueEntries.add(id);
     const amount=asNumber_(e.amount,'amount',999999999);
     if(amount<=0||!allowedType_(e.kind))throw Error('Invalid expense amount/type.');
+    if(e.isCreditCard !== undefined && typeof e.isCreditCard !== 'boolean') throw Error('Invalid credit card flag in backup.');
+    if(e.isCreditCard===true && e.kind!=='expense')throw Error('Credit card flag must belong to an Expense entry.');
     return {id,date,categoryId,amount,note:text_(e.note,160,'note',false),kind:e.kind,
-      createdAt:String(e.createdAt||stamp_()).slice(0,40),updatedAt:String(e.updatedAt||stamp_()).slice(0,40)};
+      createdAt:String(e.createdAt||stamp_()).slice(0,40),updatedAt:String(e.updatedAt||stamp_()).slice(0,40),
+      isCreditCard:e.isCreditCard===undefined?false:e.isCreditCard};
   });
   const plans={};
   Object.keys(raw.plans).forEach(month=>{
@@ -370,29 +455,41 @@ function validateSnapshot_(raw) {
   const rawDefaults=raw.categoryBudgets||{}, rawOverrides=raw.categoryBudgetOverrides||{};
   if(!rawDefaults||Array.isArray(rawDefaults)||typeof rawDefaults!=='object'||!rawOverrides||Array.isArray(rawOverrides)||typeof rawOverrides!=='object')throw Error('Invalid category budget backup.');
   for(const [id,v] of Object.entries(rawDefaults)) {
-    const c=categories.find(x=>x.id===id);if(!c||c.kind!=='expense')throw Error('Invalid budget category.');
+    const c=categories.find(x=>x.id===id);if(!budgetEligible_(c))throw Error('Invalid budget category.');
     defaultRules[id]=asNumber_(v,'default category budget',999999999);
   }
   for(const [m,rules] of Object.entries(rawOverrides)) {
     if(!isMonth_(m)||!rules||Array.isArray(rules)||typeof rules!=='object')throw Error('Invalid month override.');
     overrideRules[m]={};
     for(const [id,v] of Object.entries(rules)) {
-      const c=categories.find(x=>x.id===id);if(!c||c.kind!=='expense')throw Error('Invalid override category.');
+      const c=categories.find(x=>x.id===id);if(!budgetEligible_(c))throw Error('Invalid override category.');
       overrideRules[m][id]=asNumber_(v,'monthly category budget',999999999);
     }
   }
   if(Object.keys(defaultRules).length>150 || Object.values(overrideRules).reduce((t,x)=>t+Object.keys(x).length,0)>3000)throw Error('Too many category budget rows.');
-  return {entries,categories,plans,categoryBudgets:defaultRules,categoryBudgetOverrides:overrideRules};
+  // Backups from V3.2.1 or older do not contain this setting: preserve the live opening settings.
+  let creditCardSettings = null;
+  if (raw.creditCardSettings !== undefined) {
+    const c = raw.creditCardSettings;
+    if (!c || typeof c !== 'object' || Array.isArray(c) || !isMonth_(c.openingMonth) ||
+        Number(c.openingMonth.slice(0,4)) < 2026) throw Error('Invalid credit card opening settings.');
+    creditCardSettings={openingMonth:c.openingMonth,openingAmount:asNumber_(c.openingAmount,'opening outstanding',999999999)};
+  }
+  return {entries,categories,plans,categoryBudgets:defaultRules,categoryBudgetOverrides:overrideRules,creditCardSettings};
 }
 function replaceData_(ss,clean) {
   // Confirmed backup/restore operation. Restore is NOT an atomic Sheets transaction.
   const map={
     categories:clean.categories.map(c=>[safeCell_(c.id),safeCell_(c.name),c.kind]),
-    transactions:clean.entries.map(e=>[safeCell_(e.id),e.date,safeCell_(e.categoryId),e.amount,safeCell_(e.note),e.kind,e.createdAt,e.updatedAt]),
+    transactions:clean.entries.map(e=>[safeCell_(e.id),e.date,safeCell_(e.categoryId),e.amount,safeCell_(e.note),e.kind,e.createdAt,e.updatedAt,e.isCreditCard?'TRUE':'FALSE']),
     plans:Object.keys(clean.plans).sort().map(m=>[m,clean.plans[m].income,clean.plans[m].budget]),
     categoryBudgets:Object.entries(clean.categoryBudgets||{}).map(([id,n])=>[safeCell_(id),n]),
     categoryBudgetOverrides:Object.entries(clean.categoryBudgetOverrides||{}).flatMap(([m,rules])=>Object.entries(rules).map(([id,n])=>[m,safeCell_(id),n]))
   };
+  if (clean.creditCardSettings) map.creditCardSettings = [
+    ['OpeningMonth',clean.creditCardSettings.openingMonth],
+    ['OpeningAmount',String(clean.creditCardSettings.openingAmount)]
+  ];
   Object.keys(map).forEach(key=>{
     const sh=ss.getSheetByName(sheetName_(key));
     const last=sh.getLastRow();
@@ -432,7 +529,9 @@ function importTransactions(session, raw) {
       const amount=asNumber_(r.amount,'amount',999999999);
       if(amount<=0)throw Error('Invalid CSV amount.');
       const kind=r.kind&&allowedType_(r.kind)?r.kind:cat.kind;
-      incoming.push([guid_(),date,cat.id,amount,safeCell_(text_(r.note,160,'note',false)),kind,now,now]);
+      if(r.isCreditCard!==undefined && typeof r.isCreditCard!=='boolean')throw Error('Invalid CSV card flag.');
+      if(r.isCreditCard===true && kind!=='expense')throw Error('Only expenses can be paid using a credit card.');
+      incoming.push([guid_(),date,cat.id,amount,safeCell_(text_(r.note,160,'note',false)),kind,now,now,r.isCreditCard===true?'TRUE':'FALSE']);
     });
     if(cats.length>150)throw Error('Too many categories.');
     if(newCats.length){
@@ -442,7 +541,7 @@ function importTransactions(session, raw) {
     }
     const sh=ss.getSheetByName('Transactions');
     ensureRowCapacity_(sh, sh.getLastRow()+incoming.length);
-    sh.getRange(sh.getLastRow()+1,1,incoming.length,8).setValues(incoming);
+    sh.getRange(sh.getLastRow()+1,1,incoming.length,9).setValues(incoming);
     SpreadsheetApp.flush();return snapshot_(ss);
   });
 }
@@ -451,7 +550,7 @@ function clearAllData(session) {
   requireSession_(session);
   return lockRun_(function() {
     const ss=db_();
-    const clean={entries:[],categories:SEED_CATEGORIES.map((p,i)=>({id:'cat_'+i,name:p[0],kind:p[1]})),plans:{},categoryBudgets:{},categoryBudgetOverrides:{}};
+    const clean={entries:[],categories:SEED_CATEGORIES.map((p,i)=>({id:'cat_'+i,name:p[0],kind:p[1]})),plans:{},categoryBudgets:{},categoryBudgetOverrides:{},creditCardSettings:{openingMonth:'2026-01',openingAmount:0}};
     replaceData_(ss,clean);return snapshot_(ss);
   });
 }
