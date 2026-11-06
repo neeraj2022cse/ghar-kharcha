@@ -246,4 +246,88 @@ main{padding:16px 15px calc(100px + env(safe-area-inset-bottom));}
 /* V3.2.1: compact clarity for credit-card purchases vs repayments. */
 .credit-card-impact{font-size:11px;line-height:1.45;color:#126b55;background:#ecf8f1;border-left:3px solid #3eaf8b;border-radius:6px;padding:7px 9px;margin:-4px 0 12px;}
 .credit-card-impact.hidden{display:none!important;}
+
+/* Phase 1: financial transparency, not the compact UI redesign (Phase 2). */
+.hero-coverage{font-size:10px;color:#447a64;margin:5px 0 0;line-height:1.4}
+.card-reconciliation-note{font-size:11px;color:#779185;margin:6px 8px 0;line-height:1.4}
+.card-reconciliation-note.is-over{color:#a54d55;font-weight:650}
+.cash-flow-summary{padding:12px 15px;margin-top:12px;background:#f9fcfa}
+.cash-flow-summary>div{display:flex;justify-content:space-between;gap:12px;padding:7px 0;font-size:12px}
+.cash-flow-summary>div+div{border-top:1px solid var(--line)}
+.cash-flow-summary b{font-size:14px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.cash-flow-summary b.negative{color:var(--danger)}
+.cash-flow-summary p{font-size:10px;color:var(--muted);margin:8px 0 0;line-height:1.4}
+@media(max-width:350px){.cash-flow-summary>div{font-size:11px}.cash-flow-summary b{font-size:12px}}
+
+/* ------------------------------------------------------------
+  Phase 2 final mobile refinements (UI-003..CH-009)
+  Presentation only; financial business rules stay in Phase 1.
+------------------------------------------------------------- */
+.hero.hero-tap{cursor:pointer;position:relative;padding:14px 15px 12px;border-radius:19px;min-height:0;}
+.hero.hero-tap:hover{box-shadow:0 14px 30px rgba(31,112,75,.13);}
+.hero.hero-tap:focus-visible{outline:3px solid #239d7d;outline-offset:3px;}
+.hero.hero-tap .hero-heading{font-size:9px;letter-spacing:.72px;}
+.hero.hero-tap .hero-heading .hero-star .ui-svg{width:16px;height:16px;}
+.hero.hero-tap .hero-label{font-size:11px;margin:7px 0 1px;}
+.hero.hero-tap .hero-amount{font-size:clamp(28px,8.7vw,37px);line-height:1.08;margin:2px 0 9px;max-width:80%;}
+.hero.hero-tap .hero-decoration{height:48px;width:51px;right:14px;top:39px;border-radius:14px;}
+.hero.hero-tap .hero-decoration .ui-svg{width:31px;height:31px;}
+.hero.hero-tap .floating-coin{height:23px;width:23px;font-size:13px;right:-5px;top:-9px;}
+.hero.hero-tap .hero-decoration::before{left:8px;right:8px;top:13px;}
+.hero.hero-tap .hero-meta{font-size:10px;gap:5px;}
+.hero.hero-tap .track{height:7px;margin-top:8px;}
+.hero.hero-tap .hero-foot{font-size:10px;margin:7px 0 0;line-height:1.3;}
+.hero.hero-tap .hero-coverage{font-size:9px;margin:3px 0 0;line-height:1.32;}
+.hero.hero-tap .planned-savings{font-size:10px;margin:5px 0 0;}
+.hero-open-link{display:inline-flex;gap:5px;align-items:center;font-size:10px;font-weight:800;color:#237b60;margin-top:5px;}
+.hero-open-link .ui-svg{width:12px;height:12px;}
+.master-breakdown{padding:9px 12px!important;margin-top:9px;margin-bottom:8px;border-radius:16px;}
+.breakdown-header{display:flex;align-items:center;justify-content:space-between;gap:8px;border-bottom:1px solid #ecf1ee;padding:2px 0 6px;color:#3e6657;}
+.breakdown-header strong{font-size:11px;}
+.breakdown-header>span{font-size:10px;color:#779386;}
+.breakdown-row{padding:7px 0;font-size:11px;}
+.breakdown-row>span{gap:5px;}
+.breakdown-row strong{font-size:12px;font-variant-numeric:tabular-nums;text-align:right;min-width:0;line-height:1.3;}
+.breakdown-row span small{font-size:9px;}
+.breakdown-limit{color:#6d8b80;font-weight:650;}
+.budget-slash{color:#94a79d;padding:0 2px;font-weight:600;}
+.metric-grid{gap:8px;margin-top:8px;}
+.metric{padding:9px 10px!important;min-height:76px!important;border-radius:16px;display:flex;flex-direction:column;justify-content:space-between;gap:1px;}
+.metric-top{align-items:center;gap:6px;}
+.metric-top>span:first-child{font-size:10px;line-height:1.15;padding-top:0;}
+.metric-symbol{width:26px;height:26px;border-radius:9px;flex:0 0 26px;}
+.metric-symbol .ui-svg{height:15px;width:15px;}
+.metric strong{font-size:clamp(15px,4.7vw,20px);line-height:1.1;letter-spacing:-.6px;}
+.metric small{font-size:9px;line-height:1.15;margin-top:2px;}
+/* Continuous segmented bar: under budget green; overshoot red; grey for unused. */
+.cat-bar.segmented-progress{display:flex;align-items:stretch;overflow:hidden;width:100%;height:9px;background:#ebf1ed;border-radius:999px;gap:0;}
+.cat-bar.segmented-progress i{display:block;flex:0 0 auto;height:100%;border-radius:0;min-width:0;margin:0;transition:width .2s ease;}
+.cat-bar.segmented-progress .progress-within{background:#30A783;}
+.cat-bar.segmented-progress .progress-over{background:#E0777C;}
+.cat-bar.segmented-progress.budget-not-set{background:#edf1f1;}
+.chart-legend.compact-legend{display:flex;flex-wrap:wrap;align-items:center;gap:8px 15px;color:#70857c;font-size:10px;line-height:1.3;margin-top:10px;}
+.compact-legend>span{display:inline-flex;align-items:center;gap:5px;}
+.legend-line{height:4px;width:20px;border-radius:5px;display:inline-block;flex-shrink:0;}
+.line-blue{background:#75A8DD;}.line-green,.line-teal{background:#2FA883;}.line-red{background:#E0777C;}.line-violet{background:#8278D3;}.line-amber{background:#D9A053;}
+.annual-columns-legend{justify-content:center;margin-top:9px;}
+#annual-columns-chart svg{display:block;width:100%;height:auto;max-height:270px;}
+#annual-columns-card .chart-title{margin-bottom:8px;}
+/* Keep 5-tab nav and all content comfortable on smaller handsets. */
+@media(max-width:380px){
+  .hero.hero-tap{padding:13px 12px 12px;}
+  .hero.hero-tap .hero-decoration{width:42px;height:43px;right:12px;top:40px;}
+  .hero.hero-tap .hero-decoration .ui-svg{height:26px;width:26px;}
+  .hero.hero-tap .hero-amount{font-size:30px;}
+  .master-breakdown{padding:8px 10px!important;}
+  .breakdown-row{font-size:10px;}
+  .breakdown-row>span small{display:none;}
+  .breakdown-row strong{font-size:10px;}
+  .metric{min-height:72px!important;padding:9px!important;}
+  .metric-top>span:first-child{font-size:9px;}
+  .metric strong{font-size:16px;}
+  .metric small{font-size:8px;}
+  .chart-legend.compact-legend{gap:7px 9px;}
+}
+@media(max-width:340px){.hero.hero-tap .hero-amount{font-size:28px;}.metric-symbol{width:23px;height:23px;flex-basis:23px;}.breakdown-header>span{font-size:9px;}}
+@media(prefers-reduced-motion:reduce){.cat-bar.segmented-progress i{transition:none;}}
 </style>
